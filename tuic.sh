@@ -12,9 +12,9 @@ uuidgen # run per needed user, save these
 
 cat <<EOF | jq . > config.json
 {
-  "server": "[::]:5858",
+  "server": "[::]:443",
   "users": {
-    "6d2c3208-0daa-4d80-9626-f6322858f85a": "user1pass",
+    "92ddbdf6-dfc7-4358-ac71-2a1668595336": "user1pass",
     "006d2a41-384f-4a88-87e8-c8e2df7bd20c": "user2pass"
   },
   "certificate": "/root/tuic/ca.crt",
