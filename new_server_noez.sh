@@ -22,3 +22,5 @@ sudo useradd -m "mivechi"
 echo "mivechi:mivechi2828" | sudo chpasswd
 
 bash <(curl -Ls https://raw.githubusercontent.com/xpanel-cp/XPanel-SSH-User-Management/master/TCP-Tweaker --ipv4)
+
+bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
