@@ -44,6 +44,18 @@ systemctl restart docker
 
 systemctl enable systemd-networkd-wait-online.service
 
+# Disable systemd-resolved safely
+if systemctl is-active --quiet systemd-resolved; then
+    systemctl disable --now systemd-resolved
+fi
+
+if [ -L /etc/resolv.conf ] || [ -f /etc/resolv.conf ]; then
+    rm -f /etc/resolv.conf
+fi
+echo "nameserver 127.0.0.1" > /etc/resolv.conf
+chattr +i /etc/resolv.conf || echo "[!] Warning: failed to lock /etc/resolv.conf"
+
+
 echo "[+] Installing Unbound"
 apt-get install -y unbound
 
@@ -83,15 +95,7 @@ Wants=network-online.target
 EOF
 
 systemctl daemon-reexec
-systemctl enable --now unbound
-systemctl restart unbound
-
-echo "[+] Disabling systemd-resolved (clean DNS)"
-systemctl disable --now systemd-resolved 2>/dev/null || true
-rm -f /etc/resolv.conf
-echo "nameserver 127.0.0.1" > /etc/resolv.conf
-# Lock resolv.conf to force Unbound usage
-chattr +i /etc/resolv.conf
+systemctl enable --now unbound || echo "[!] Warning: failed to enable/start Unbound"
 
 echo "[+] Enabling fq"
 cat >/etc/sysctl.d/99-sshuttle.conf <<EOF
@@ -103,7 +107,6 @@ EOF
 # net.core.default_qdisc = fq
 # net.ipv4.tcp_congestion_control = bbr
 # EOF
-
 
 echo "[+] Disabling IPv6"
 cat >/etc/sysctl.d/99-disable-ipv6.conf <<EOF
