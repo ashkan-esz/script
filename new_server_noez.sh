@@ -44,18 +44,11 @@ systemctl restart docker
 
 systemctl enable systemd-networkd-wait-online.service
 
-echo "[+] Disabling systemd-resolved (clean DNS)"
-systemctl disable --now systemd-resolved 2>/dev/null || true
-rm -f /etc/resolv.conf
-echo "nameserver 127.0.0.1" > /etc/resolv.conf
-# Lock resolv.conf to force Unbound usage
-chattr +i /etc/resolv.conf
-
-
 echo "[+] Installing Unbound"
 apt-get install -y unbound
 
 echo "[+] Configuring Unbound (lightweight, VPS-safe)"
+mkdir -p /etc/unbound/unbound.conf.d
 cat >/etc/unbound/unbound.conf.d/sshuttle.conf <<EOF
 server:
   interface: 127.0.0.1
@@ -90,14 +83,26 @@ Wants=network-online.target
 EOF
 
 systemctl daemon-reexec
-systemctl enable unbound
+systemctl enable --now unbound
 systemctl restart unbound
 
-echo "[+] Enabling BBR + fq"
+echo "[+] Disabling systemd-resolved (clean DNS)"
+systemctl disable --now systemd-resolved 2>/dev/null || true
+rm -f /etc/resolv.conf
+echo "nameserver 127.0.0.1" > /etc/resolv.conf
+# Lock resolv.conf to force Unbound usage
+chattr +i /etc/resolv.conf
+
+echo "[+] Enabling fq"
 cat >/etc/sysctl.d/99-sshuttle.conf <<EOF
 net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
 EOF
+
+# echo "[+] Enabling BBR + fq"
+# cat >/etc/sysctl.d/99-sshuttle.conf <<EOF
+# net.core.default_qdisc = fq
+# net.ipv4.tcp_congestion_control = bbr
+# EOF
 
 
 echo "[+] Disabling IPv6"
