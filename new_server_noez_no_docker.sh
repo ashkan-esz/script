@@ -50,13 +50,9 @@ server:
   hide-version: yes
 EOF
 
-# Ensure Unbound starts after network is fully online
-mkdir -p /etc/systemd/system/unbound.service.d
-cat >/etc/systemd/system/unbound.service.d/override.conf <<EOF
-[Unit]
-After=network-online.target
-Wants=network-online.target
-EOF
+
+# Remove override to avoid network-online dependency
+rm -rf /etc/systemd/system/unbound.service.d
 
 # Start Unbound
 systemctl daemon-reexec
