@@ -14,12 +14,12 @@ apt-get install -y \
 echo "[+] Installing Docker"
 install -m 0755 -d /etc/apt/keyrings
 
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+curl -fsSL https://download.docker.com/linux/debian/gpg \
   | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 chmod a+r /etc/apt/keyrings/docker.gpg
 
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/ubuntu \
+https://download.docker.com/linux/debian \
 $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
 > /etc/apt/sources.list.d/docker.list
 
@@ -28,6 +28,7 @@ apt-get install -y \
   docker-ce docker-ce-cli containerd.io \
   docker-buildx-plugin docker-compose-plugin docker-compose
 
+# Docker log limits (important for 1 GB VPS)
 mkdir -p /etc/docker
 cat >/etc/docker/daemon.json <<EOF
 {
@@ -41,12 +42,15 @@ EOF
 
 systemctl restart docker
 
+systemctl enable systemd-networkd-wait-online.service
+
 echo "[+] Disabling systemd-resolved (clean DNS)"
-systemctl disable --now systemd-resolved
+systemctl disable --now systemd-resolved 2>/dev/null || true
 rm -f /etc/resolv.conf
 echo "nameserver 127.0.0.1" > /etc/resolv.conf
 # Lock resolv.conf to force Unbound usage
 chattr +i /etc/resolv.conf
+
 
 echo "[+] Installing Unbound"
 apt-get install -y unbound
@@ -77,6 +81,15 @@ server:
   hide-version: yes
 EOF
 
+# Ensure Unbound starts after network is fully online
+mkdir -p /etc/systemd/system/unbound.service.d
+cat >/etc/systemd/system/unbound.service.d/override.conf <<EOF
+[Unit]
+After=network-online.target
+Wants=network-online.target
+EOF
+
+systemctl daemon-reexec
 systemctl enable unbound
 systemctl restart unbound
 
@@ -86,7 +99,8 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
 
-echo "[+] Disable ipv6"
+
+echo "[+] Disabling IPv6"
 cat >/etc/sysctl.d/99-disable-ipv6.conf <<EOF
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
@@ -119,3 +133,4 @@ systemctl disable --now snapd 2>/dev/null || true
 systemctl disable --now unattended-upgrades 2>/dev/null || true
 
 echo "[✓] Server setup complete"
+echo "[i] Log out and back in for docker/sudo group changes to apply"
