@@ -118,7 +118,4 @@ echo "[+] Disabling unnecessary services (safe on small VPS)"
 systemctl disable --now snapd 2>/dev/null || true
 systemctl disable --now unattended-upgrades 2>/dev/null || true
 
-echo "[+] Installing DnsTT"
-bash <(curl -Ls https://raw.githubusercontent.com/bugfloyd/dnstt-deploy/main/dnstt-deploy.sh)
-
 echo "[✓] Server setup complete"
