@@ -17,6 +17,8 @@ systemctl enable systemd-networkd-wait-online.service
 # Step 1: Temporary working DNS
 # -------------------------------
 echo "[+] Setting temporary DNS to 8.8.8.8 for package installation"
+# Use Google DNS temporarily in a subshell for apt only
+export RES_OPTIONS="timeout:1 rotate"
 echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
 echo "[+] Installing Unbound"
@@ -59,15 +61,23 @@ systemctl daemon-reexec
 systemctl enable --now unbound || echo "[!] Warning: failed to enable/start Unbound"
 
 # -------------------------------
-# Step 3: Lock resolv.conf to local Unbound
+# Step 4: Force resolv.conf to use Unbound after reboot
 # -------------------------------
-echo "[+] Switching system DNS to Unbound (127.0.0.1)"
-if [ -L /etc/resolv.conf ] || [ -f /etc/resolv.conf ]; then
-    rm -f /etc/resolv.conf
-fi
-echo "nameserver 127.0.0.1" > /etc/resolv.conf
-chattr +i /etc/resolv.conf || echo "[!] Warning: failed to lock /etc/resolv.conf"
+cat >/etc/systemd/system/fix-resolv.service <<'EOF'
+[Unit]
+Description=Force local Unbound DNS
+After=network.target
 
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo "nameserver 127.0.0.1" > /etc/resolv.conf'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now fix-resolv.service || echo "[!] Warning: failed to enable fix-resolv.service"
 
 echo "[+] Enabling fq"
 cat >/etc/sysctl.d/99-sshuttle.conf <<EOF
