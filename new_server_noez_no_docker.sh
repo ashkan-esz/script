@@ -13,19 +13,14 @@ apt-get install -y \
 
 systemctl enable systemd-networkd-wait-online.service
 
-# Disable systemd-resolved safely
-if systemctl is-active --quiet systemd-resolved; then
-    systemctl disable --now systemd-resolved
-fi
-
-if [ -L /etc/resolv.conf ] || [ -f /etc/resolv.conf ]; then
-    rm -f /etc/resolv.conf
-fi
-echo "nameserver 127.0.0.1" > /etc/resolv.conf
-chattr +i /etc/resolv.conf || echo "[!] Warning: failed to lock /etc/resolv.conf"
-
+# -------------------------------
+# Step 1: Temporary working DNS
+# -------------------------------
+echo "[+] Setting temporary DNS to 8.8.8.8 for package installation"
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
 
 echo "[+] Installing Unbound"
+apt-get update
 apt-get install -y unbound
 
 echo "[+] Configuring Unbound (lightweight, VPS-safe)"
@@ -63,8 +58,20 @@ After=network-online.target
 Wants=network-online.target
 EOF
 
+# Start Unbound
 systemctl daemon-reexec
 systemctl enable --now unbound || echo "[!] Warning: failed to enable/start Unbound"
+
+# -------------------------------
+# Step 3: Lock resolv.conf to local Unbound
+# -------------------------------
+echo "[+] Switching system DNS to Unbound (127.0.0.1)"
+if [ -L /etc/resolv.conf ] || [ -f /etc/resolv.conf ]; then
+    rm -f /etc/resolv.conf
+fi
+echo "nameserver 127.0.0.1" > /etc/resolv.conf
+chattr +i /etc/resolv.conf || echo "[!] Warning: failed to lock /etc/resolv.conf"
+
 
 echo "[+] Enabling fq"
 cat >/etc/sysctl.d/99-sshuttle.conf <<EOF
@@ -83,7 +90,7 @@ net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 EOF
 
-sysctl --system
+sysctl --system || true 
 
 echo "[+] Adding TCP MSS clamping"
 iptables -t mangle -C POSTROUTING -p tcp --tcp-flags SYN,RST SYN \
