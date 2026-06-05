@@ -1,9 +1,9 @@
 #!/bin/bash
 # set -e
 
-echo "[+] Creating users"
-useradd -m amene || true
-echo "amene:amene2828" | chpasswd
+echo "[+] Creating user -> gang:Gang!@#123 "
+useradd -m gang || true
+echo "gang:Gang!@#123" | chpasswd
 
 echo "[+] Updating system"
 apt-get update
@@ -54,4 +54,16 @@ echo "[+] Disabling unnecessary services (safe on small VPS)"
 systemctl disable --now snapd 2>/dev/null || true
 systemctl disable --now unattended-upgrades 2>/dev/null || true
 
+echo "[+] Installing master dns vpn: 953c72f45cc7518051016382586d7a87 --> encrypt_key.txt"
+echo '953c72f45cc7518051016382586d7a87' > /root/encrypt_key.txt
+
+echo "[+] Installing master dns vpn: adding server_config.toml"
+curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/master_dns_g69_server_config.toml -o /root/server_config.toml
+
+echo "[+] Installing master dns vpn script (c.g69.lol)"
+bash <(curl -Ls https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh) --version v2026.04.05.191930-7757d2d
+
 echo "[✓] Server setup complete"
+
+echo "[+] Better to change the password"
+
