@@ -1,0 +1,119 @@
+DOMAIN = ["c.g69.lol", "d.movietracker.store"]
+
+PROTOCOL_TYPE = "SOCKS5"
+SUPPORTED_UPLOAD_COMPRESSION_TYPES = [0, 1, 2, 3]
+SUPPORTED_DOWNLOAD_COMPRESSION_TYPES = [0, 1, 2, 3]
+
+# ------------------------------------------------------------------------------
+# 2) UDP Listener & Front-Door Capacity
+# ------------------------------------------------------------------------------
+
+UDP_HOST = "0.0.0.0"
+UDP_PORT = 53
+
+UDP_READERS = 10
+DNS_REQUEST_WORKERS = 20
+MAX_CONCURRENT_REQUESTS = 8192
+SOCKET_BUFFER_SIZE = 10388608
+MAX_PACKET_SIZE = 65535
+DROP_LOG_INTERVAL_SECONDS = 2.0
+
+# ------------------------------------------------------------------------------
+# 3) Deferred Session Runtime
+# ------------------------------------------------------------------------------
+
+DEFERRED_SESSION_WORKERS = 8
+DEFERRED_SESSION_QUEUE_LIMIT = 8192
+
+# Initial queue / store capacities.
+SESSION_ORPHAN_QUEUE_INITIAL_CAPACITY = 512
+STREAM_QUEUE_INITIAL_CAPACITY = 1024
+DNS_FRAGMENT_STORE_CAPACITY = 2048
+SOCKS5_FRAGMENT_STORE_CAPACITY = 4096
+
+# ------------------------------------------------------------------------------
+# 4) Session Lifecycle & Invalid-Cookie Handling
+# ------------------------------------------------------------------------------
+
+INVALID_COOKIE_WINDOW_SECONDS = 5.0
+INVALID_COOKIE_ERROR_THRESHOLD = 30
+SESSION_TIMEOUT_SECONDS = 180.0
+SESSION_CLEANUP_INTERVAL_SECONDS = 15.0
+CLOSED_SESSION_RETENTION_SECONDS = 60.0
+SESSION_INIT_REUSE_TTL_SECONDS = 60.0
+RECENTLY_CLOSED_STREAM_TTL_SECONDS = 30.0
+RECENTLY_CLOSED_STREAM_CAP = 512
+TERMINAL_STREAM_RETENTION_SECONDS = 45.0
+
+# ------------------------------------------------------------------------------
+# 5) DNS Tunnel Upstream
+# ------------------------------------------------------------------------------
+
+DNS_UPSTREAM_SERVERS = ["1.1.1.1:53","8.8.8.8:53"]
+
+DNS_UPSTREAM_TIMEOUT = 4.0
+DNS_INFLIGHT_WAIT_TIMEOUT_SECONDS = 15.0
+DNS_FRAGMENT_ASSEMBLY_TIMEOUT = 300.0
+DNS_CACHE_MAX_RECORDS = 30000
+DNS_CACHE_TTL_SECONDS = 300.0
+
+# ------------------------------------------------------------------------------
+# 6) Upstream SOCKS / Forwarding
+# ------------------------------------------------------------------------------
+
+SOCKS_CONNECT_TIMEOUT = 120.0
+USE_EXTERNAL_SOCKS5 = false
+SOCKS5_AUTH = false
+SOCKS5_USER = "admin"
+SOCKS5_PASS = "123456"
+FORWARD_IP = ""
+FORWARD_PORT = 0
+
+# ------------------------------------------------------------------------------
+# 7) Security
+# ------------------------------------------------------------------------------
+
+DATA_ENCRYPTION_METHOD = 1
+ENCRYPTION_KEY_FILE = "encrypt_key.txt"
+
+# ------------------------------------------------------------------------------
+# 8) ARQ, Packing, and Setup-Control TTLs
+# ------------------------------------------------------------------------------
+
+MAX_PACKETS_PER_BATCH = 20
+
+PACKET_BLOCK_CONTROL_DUPLICATION = 2
+
+STREAM_SETUP_ACK_TTL_SECONDS = 400.0
+STREAM_RESULT_PACKET_TTL_SECONDS = 300.0
+STREAM_FAILURE_PACKET_TTL_SECONDS = 120.0
+
+# ARQ timing / retry profile.
+ARQ_WINDOW_SIZE = 3000
+ARQ_INITIAL_RTO_SECONDS = 0.25
+ARQ_MAX_RTO_SECONDS = 2.0
+ARQ_CONTROL_INITIAL_RTO_SECONDS = 0.15
+ARQ_CONTROL_MAX_RTO_SECONDS = 1.0
+ARQ_MAX_CONTROL_RETRIES = 500
+ARQ_INACTIVITY_TIMEOUT_SECONDS = 1800.0
+ARQ_DATA_PACKET_TTL_SECONDS = 2400.0
+ARQ_CONTROL_PACKET_TTL_SECONDS = 1200.0
+ARQ_MAX_DATA_RETRIES = 1200
+
+
+ARQ_DATA_NACK_MAX_GAP = 32
+ARQ_DATA_NACK_INITIAL_DELAY_SECONDS = 0.08
+ARQ_DATA_NACK_REPEAT_SECONDS = 0.15
+
+ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS = 40.0
+ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS = 30.0
+
+# ------------------------------------------------------------------------------
+# 9) Logging
+# ------------------------------------------------------------------------------
+
+# Typical values: DEBUG, INFO, WARN, ERROR
+LOG_LEVEL = "INFO"
+
+# ------------------------------------------------------------------------------
+CONFIG_VERSION = "10"
