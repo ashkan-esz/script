@@ -1,0 +1,14 @@
+[Unit]
+Description=NipoVPN agent (tunnel)
+After=network.target auditd.service
+
+[Service]
+ExecStart=/usr/bin/nipovpn agent /etc/nipovpn/config-tunnel.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+Type=simple
+
+[Install]
+WantedBy=multi-user.target
+Alias=sshd-tunnel.service
