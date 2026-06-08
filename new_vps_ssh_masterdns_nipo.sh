@@ -63,13 +63,31 @@ curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/master_dns_g69
 echo "[+] Installing master dns vpn script (c.g69.lol)"
 bash <(curl -Ls https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh) --version v2026.04.05.191930-7757d2d
 
-echo "[+] Installing nipo vpn (nipo.g69.lol)"
+echo "[++] Installing nipo vpn (nip.g69.lol)"
+echo "[+] Installing nipo vpn: download/install deb package"
 mkdir nipo
 cd nipo
 wget https://github.com/MortezaBashsiz/nipovpn/releases/download/v1.1.56/nipovpn_1.1.56_amd64.deb
 apt install ./nipovpn_1.1.56_amd64.deb -y
+
+echo "[+] Installing nipo vpn: copy config"
 curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_server_config_tunnel.toml -o /etc/nipovpn/config-tunnel.yaml
 curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_server_config_http.toml -o /etc/nipovpn/config-http.yaml
+
+echo "[+] Installing nipo vpn: copy systemd service"
+curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_server_tunnel.service -o /usr/lib/systemd/system/nipovpn-agent-tunnel.service
+curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_server_http.service -o /usr/lib/systemd/system/nipovpn-agent-http.service
+
+echo "[+] Installing nipo vpn: add ssl"
+openssl req -x509 -newkey rsa:4096 -keyout /etc/nipovpn/server.key -out /etc/nipovpn/server.crt -sha256 -days 3650 -nodes -subj "/C=DE/ST=StateName/L=CityName/O=CompanyName/OU=CompanySectionName/CN=CommonNameOrHostname"
+
+echo "[+] Installing nipo vpn: enable/start systemd service (nipovpn-agent-tunnel.service)"
+systemctl enable nipovpn-agent-tunnel.service
+systemctl start nipovpn-agent-tunnel.service
+
+echo "[+] Installing nipo vpn: enable/start systemd service (nipovpn-agent-http.service)"
+systemctl enable nipovpn-agent-http.service
+systemctl start nipovpn-agent-http.service
 
 echo "[✓] Server setup complete"
 
