@@ -81,13 +81,13 @@ curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_serve
 echo "[+] Installing nipo vpn: add ssl"
 openssl req -x509 -newkey rsa:4096 -keyout /etc/nipovpn/server.key -out /etc/nipovpn/server.crt -sha256 -days 3650 -nodes -subj "/C=DE/ST=StateName/L=CityName/O=CompanyName/OU=CompanySectionName/CN=CommonNameOrHostname"
 
-echo "[+] Installing nipo vpn: enable/start systemd service (nipovpn-agent-tunnel.service)"
-systemctl enable nipovpn-agent-tunnel.service
-systemctl start nipovpn-agent-tunnel.service
+echo "[+] Installing nipo vpn: enable/start systemd service (nipovpn-server-tunnel.service)"
+systemctl enable nipovpn-server-tunnel.service
+systemctl start nipovpn-server-tunnel.service
 
-echo "[+] Installing nipo vpn: enable/start systemd service (nipovpn-agent-http.service)"
-systemctl enable nipovpn-agent-http.service
-systemctl start nipovpn-agent-http.service
+echo "[+] Installing nipo vpn: enable/start systemd service (nipovpn-server-http.service)"
+systemctl enable nipovpn-server-http.service
+systemctl start nipovpn-server-http.service
 
 echo "[✓] Server setup complete"
 
