@@ -1,9 +1,9 @@
 [Unit]
-Description=NipoVPN agent (tunnel)
+Description=NipoVPN server (tunnel)
 After=network.target auditd.service
 
 [Service]
-ExecStart=/usr/bin/nipovpn agent /etc/nipovpn/config-tunnel.yaml
+ExecStart=/usr/bin/nipovpn server /etc/nipovpn/config-tunnel.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 KillMode=process
 Restart=on-failure
