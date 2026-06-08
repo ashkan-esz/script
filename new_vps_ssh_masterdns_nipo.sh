@@ -68,6 +68,8 @@ mkdir nipo
 cd nipo
 wget https://github.com/MortezaBashsiz/nipovpn/releases/download/v1.1.56/nipovpn_1.1.56_amd64.deb
 apt install ./nipovpn_1.1.56_amd64.deb -y
+curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_server_config_tunnel.toml -o /etc/nipovpn/config-tunnel.yaml
+curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_server_config_http.toml -o /etc/nipovpn/config-http.yaml
 
 echo "[✓] Server setup complete"
 
