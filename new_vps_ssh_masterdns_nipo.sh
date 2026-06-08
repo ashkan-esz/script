@@ -75,8 +75,8 @@ curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_serve
 curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_server_config_http.toml -o /etc/nipovpn/config-http.yaml
 
 echo "[+] Installing nipo vpn: copy systemd service"
-curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_server_tunnel.service -o /usr/lib/systemd/system/nipovpn-agent-tunnel.service
-curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_server_http.service -o /usr/lib/systemd/system/nipovpn-agent-http.service
+curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_server_tunnel.service -o /usr/lib/systemd/system/nipovpn-server-tunnel.service
+curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/nipo_g69_server_http.service -o /usr/lib/systemd/system/nipovpn-server-http.service
 
 echo "[+] Installing nipo vpn: add ssl"
 openssl req -x509 -newkey rsa:4096 -keyout /etc/nipovpn/server.key -out /etc/nipovpn/server.crt -sha256 -days 3650 -nodes -subj "/C=DE/ST=StateName/L=CityName/O=CompanyName/OU=CompanySectionName/CN=CommonNameOrHostname"
