@@ -91,6 +91,7 @@ systemctl start nipovpn-server-http.service
 
 echo "[+] Installing EZxray_Direct_Server"
 bash <(curl -s https://raw.githubusercontent.com/greencolor7676/EZxray_Direct_Server/main/EZxray.sh)
+cat /root/xray-configs-12-protocols.txt
 
 echo "[✓] Server setup complete"
 
