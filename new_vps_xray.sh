@@ -21,6 +21,21 @@ SERVICE_NAME="ezxray.service"
 SERVICE_USER="ezxray"
 SERVICE_GROUP="ezxray"
 BACKUP_ROOT="${EZXRAY_DIR}/backups"
+SYSTEMD_UNIT_DIRS=(
+    /etc/systemd/system.control
+    /run/systemd/system.control
+    /run/systemd/transient
+    /run/systemd/generator.early
+    /etc/systemd/system
+    /etc/systemd/system.attached
+    /run/systemd/system
+    /run/systemd/system.attached
+    /run/systemd/generator
+    /usr/local/lib/systemd/system
+    /usr/lib/systemd/system
+    /lib/systemd/system
+    /run/systemd/generator.late
+)
 
 SELECTED_PORTS=()
 OLD_PORTS=()
@@ -37,7 +52,7 @@ die() {
 usage() {
     cat <<'EOF'
 Usage: EZxray.sh [--domain DOMAIN] [--tls-cert FILE] [--tls-key FILE]
-                 [--ports P1,P2,...,P12] [--reconfigure]
+                 [--ports P1,P2,...,P12] [--reconfigure] [--status]
 
 On first install, omitted domain and TLS paths are requested interactively.
 Automatic port selection skips 443. An explicitly supplied 443 is accepted
@@ -52,6 +67,7 @@ Options:
   --tls-key FILE        Matching PEM private key
   --ports LIST          Exactly 12 unique ports, comma-separated
   --reconfigure         Update this script's managed installation (with backup)
+  --status              Show installation, service, port, and UFW status
   -h, --help            Show this help
 EOF
 }
@@ -709,6 +725,450 @@ with open(path, "w", encoding="utf-8") as output:
 PY
 }
 
+managed_artifact_paths() {
+    printf '%s\n' \
+        "$XRAY_CONFIG_PATH" \
+        "$PROFILE_PATH" \
+        "$STATE_PATH" \
+        "$MARKER_PATH" \
+        "$SERVICE_PATH" \
+        "$XRAY_BIN" \
+        "$TLS_CERT_MANAGED_PATH" \
+        "$TLS_KEY_MANAGED_PATH"
+}
+
+path_has_symlink_parent() {
+    local path_dir
+    path_dir=$(dirname -- "$1")
+    while [[ $path_dir != / ]]; do
+        [[ -L $path_dir ]] && return 0
+        path_dir=$(dirname -- "$path_dir")
+    done
+    return 1
+}
+
+is_managed_install_marker() {
+    [[ -d $EZXRAY_DIR && ! -L $EZXRAY_DIR && -f $MARKER_PATH && ! -L $MARKER_PATH ]] || return 1
+    path_has_symlink_parent "$MARKER_PATH" && return 1
+    [[ $(< "$MARKER_PATH") == "EZxray managed ${EZXRAY_VERSION}" ]]
+}
+
+has_managed_artifacts() {
+    local target
+    while IFS= read -r target; do
+        [[ -e $target || -L $target ]] && return 0
+    done < <(managed_artifact_paths)
+    return 1
+}
+
+read_status_metadata() {
+    local metadata
+    local -a fields=()
+    STATUS_STATE_DOMAIN=""
+    STATUS_STATE_PORTS=()
+
+    if ! metadata=$(python3 - "$STATE_PATH" 2>/dev/null <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    state = json.load(source)
+if not isinstance(state, dict) or state.get("schema") != 1:
+    raise SystemExit(1)
+
+domain = state.get("domain")
+certificate = state.get("tls_cert", "")
+private_key = state.get("tls_key", "")
+ports = state.get("ports", [])
+credentials = state.get("credentials", {})
+if not isinstance(domain, str) or not domain or not isinstance(certificate, str) or not isinstance(private_key, str):
+    raise SystemExit(1)
+values = [domain, certificate, private_key]
+if len(ports) != 12 or len(set(ports)) != 12:
+    raise SystemExit(1)
+if any(not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535 for port in ports):
+    raise SystemExit(1)
+for name in ("vless", "vmess", "trojan", "shadowsocks"):
+    entries = credentials.get(name, [])
+    if not isinstance(entries, list) or len(entries) != 3:
+        raise SystemExit(1)
+    values.extend(entries)
+if any(not isinstance(value, str) or "\n" in value for value in values):
+    raise SystemExit(1)
+
+print(domain)
+print(",".join(str(port) for port in ports))
+PY
+    ); then
+        return 1
+    fi
+
+    mapfile -t fields <<< "$metadata"
+    [[ ${#fields[@]} -eq 2 ]] || return 1
+    STATUS_STATE_DOMAIN=${fields[0]}
+    IFS=, read -r -a STATUS_STATE_PORTS <<< "${fields[1]}"
+    [[ ${#STATUS_STATE_PORTS[@]} -eq 12 ]]
+}
+
+show_status() {
+    local installation="not installed"
+    local version="unknown"
+    local domain="unavailable"
+    local ports="unavailable"
+    local marker_text=""
+    local service_active="unavailable"
+    local service_enabled="unavailable"
+    local ufw_state="unavailable"
+    local ufw_output=""
+
+    if [[ -e $MARKER_PATH || -L $MARKER_PATH ]]; then
+        if [[ -f $MARKER_PATH && ! -L $MARKER_PATH ]]; then
+            marker_text=$(< "$MARKER_PATH")
+        fi
+        if [[ $marker_text =~ ^EZxray\ managed\ (v[[:alnum:]_.-]+)$ ]]; then
+            version=${BASH_REMATCH[1]}
+        fi
+        if is_managed_install_marker; then
+            if [[ -f $STATE_PATH && ! -L $STATE_PATH ]] && read_status_metadata && (DOMAIN=$STATUS_STATE_DOMAIN; validate_domain) >/dev/null 2>&1; then
+                installation="installed"
+                domain=${STATUS_STATE_DOMAIN,,}
+                ports=$(IFS=,; printf '%s' "${STATUS_STATE_PORTS[*]}")
+                version=$EZXRAY_VERSION
+            else
+                installation="invalid (managed marker found; state is missing or invalid)"
+            fi
+        else
+            installation="unrecognized marker"
+        fi
+    elif has_managed_artifacts; then
+        installation="incomplete (managed marker is missing)"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        service_active=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)
+        service_enabled=$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)
+        case $service_active in
+            active|inactive|failed|activating|deactivating|reloading|maintenance) ;;
+            *) service_active="unknown" ;;
+        esac
+        case $service_enabled in
+            enabled|enabled-runtime|linked|linked-runtime|disabled|static|indirect|masked|masked-runtime|generated|transient|alias|not-found) ;;
+            *) service_enabled="unknown" ;;
+        esac
+    fi
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw_output=$(ufw status 2>/dev/null || true)
+        case $ufw_output in
+            *"Status: active"*) ufw_state="active" ;;
+            *"Status: inactive"*) ufw_state="inactive" ;;
+            *) ufw_state="unknown" ;;
+        esac
+    fi
+
+    printf 'Installation: %s\n' "$installation"
+    printf 'Version: %s\n' "$version"
+    printf 'Service active: %s\n' "$service_active"
+    printf 'Service enabled: %s\n' "$service_enabled"
+    printf 'Domain: %s\n' "$domain"
+    printf 'Ports: %s\n' "$ports"
+    printf 'UFW: %s\n' "$ufw_state"
+}
+
+is_interactive_tty() {
+    [[ -t 0 && -t 1 ]]
+}
+
+interactive_menu() {
+    local choice
+    while true; do
+        cat <<'EOF'
+
+EZxray control menu
+  1) Install
+  2) Update
+  3) Delete
+  4) Status
+  5) Help
+  6) Exit
+EOF
+        printf 'Choose an option [1-6]: '
+        if ! IFS= read -r choice; then
+            printf '\nNo input received; exiting without changes.\n'
+            return 0
+        fi
+
+        case $choice in
+            1)
+                RECONFIGURE=false
+                run_install
+                ;;
+            2)
+                RECONFIGURE=true
+                run_install
+                ;;
+            3) delete_installation || printf 'Deletion did not complete.\n' ;;
+            4) show_status ;;
+            5) usage ;;
+            6)
+                printf 'Exiting.\n'
+                return 0
+                ;;
+            *) printf 'Invalid choice. Enter a number from 1 to 6.\n' ;;
+        esac
+    done
+}
+
+validate_managed_delete_targets() {
+    local target
+    while IFS= read -r target; do
+        if path_has_symlink_parent "$target"; then
+            printf 'EZxray: refusing to remove artifacts through a symlinked parent: %s\n' "$target" >&2
+            return 1
+        fi
+        if [[ ( -e $target || -L $target ) && ! -f $target && ! -L $target ]]; then
+            printf 'EZxray: refusing to remove unexpected directory or special file: %s\n' "$target" >&2
+            return 1
+        fi
+    done < <(managed_artifact_paths)
+}
+
+other_systemd_unit_uses_service_account() {
+    local user_uid=$1 group_gid=$2 unit_dir unit_file grep_status
+    local user_uid_octal group_gid_octal user_uid_hex group_gid_hex
+    local user_reference group_reference supplementary_reference
+    local -a unit_dirs=()
+    if (($# > 2)); then
+        unit_dirs=("${@:3}")
+    else
+        unit_dirs=("${SYSTEMD_UNIT_DIRS[@]}")
+    fi
+
+    command -v grep >/dev/null 2>&1 || return 0
+    printf -v user_uid_octal '%o' "$user_uid"
+    printf -v group_gid_octal '%o' "$group_gid"
+    printf -v user_uid_hex '%x' "$user_uid"
+    printf -v group_gid_hex '%x' "$group_gid"
+    user_reference="^[[:space:]]*(User|SocketUser)[[:space:]]*=[[:space:]]*[\"']?[+-]?(${SERVICE_USER}|${user_uid}|0+${user_uid_octal}|0[xX]0*${user_uid_hex})[\"']?([[:space:]]*(#.*)?$)"
+    group_reference="^[[:space:]]*(Group|SocketGroup)[[:space:]]*=[[:space:]]*[\"']?[+-]?(${SERVICE_GROUP}|${group_gid}|0+${group_gid_octal}|0[xX]0*${group_gid_hex})[\"']?([[:space:]]*(#.*)?$)"
+    supplementary_reference="^[[:space:]]*SupplementaryGroups[[:space:]]*=[[:space:]]*([^#]*[[:space:]])?[\"']?[+-]?(${SERVICE_GROUP}|${group_gid}|0+${group_gid_octal}|0[xX]0*${group_gid_hex})[\"']?([[:space:]#]|$)"
+    continued_identity_directive='^[[:space:]]*(User|Group|SocketUser|SocketGroup|SupplementaryGroups)[[:space:]]*=.*\\[[:space:]]*$'
+    for unit_dir in "${unit_dirs[@]}"; do
+        [[ -d $unit_dir ]] || continue
+        [[ -r $unit_dir ]] || return 0
+        for unit_file in \
+            "$unit_dir"/*.service \
+            "$unit_dir"/*.service.d/*.conf \
+            "$unit_dir"/*.socket \
+            "$unit_dir"/*.socket.d/*.conf; do
+            [[ -f $unit_file ]] || continue
+            [[ $unit_file == "$SERVICE_PATH" || $unit_file == "${SERVICE_PATH}.d/"* ]] && continue
+            if grep -Eq "$continued_identity_directive" "$unit_file"; then
+                return 0
+            else
+                grep_status=$?
+                ((grep_status == 1)) || return 0
+            fi
+            if grep -Eiq "$user_reference" "$unit_file"; then
+                return 0
+            else
+                grep_status=$?
+                ((grep_status == 1)) || return 0
+            fi
+            if grep -Eiq "$group_reference|$supplementary_reference" "$unit_file"; then
+                return 0
+            else
+                grep_status=$?
+                ((grep_status == 1)) || return 0
+            fi
+        done
+    done
+    return 1
+}
+
+service_account_removal_safe() {
+    local passwd_entry group_entry passwd_database user_name user_uid user_gid user_home user_shell
+    local group_name group_gid group_members user_groups passwd_user passwd_primary_gid
+    command -v getent >/dev/null 2>&1 || return 1
+
+    passwd_entry=$(getent passwd "$SERVICE_USER" 2>/dev/null || true)
+    group_entry=$(getent group "$SERVICE_GROUP" 2>/dev/null || true)
+    if [[ -z $passwd_entry && -z $group_entry ]]; then
+        return 0
+    fi
+    [[ -n $passwd_entry && -n $group_entry ]] || return 1
+
+    IFS=: read -r user_name _ user_uid user_gid _ user_home user_shell <<< "$passwd_entry"
+    IFS=: read -r group_name _ group_gid group_members <<< "$group_entry"
+    [[ $user_name == "$SERVICE_USER" && $group_name == "$SERVICE_GROUP" ]] || return 1
+    [[ $user_uid =~ ^[0-9]+$ && $user_uid -ne 0 ]] || return 1
+    [[ $user_gid == "$group_gid" && $user_home == /nonexistent && $user_shell == /usr/sbin/nologin ]] || return 1
+    [[ -z $group_members || $group_members == "$SERVICE_USER" ]] || return 1
+
+    passwd_database=$(getent passwd 2>/dev/null) || return 1
+    while IFS=: read -r passwd_user _ _ passwd_primary_gid _ _ _; do
+        [[ $passwd_user == "$SERVICE_USER" ]] && continue
+        [[ $passwd_primary_gid == "$group_gid" ]] && return 1
+    done <<< "$passwd_database"
+
+    command -v id >/dev/null 2>&1 || return 1
+    user_groups=$(id -G "$SERVICE_USER" 2>/dev/null) || return 1
+    [[ $user_groups == "$group_gid" ]] || return 1
+    ! other_systemd_unit_uses_service_account "$user_uid" "$group_gid"
+}
+
+stop_disable_managed_service() {
+    local active_state enabled_state
+    active_state=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)
+    [[ -n $active_state ]] || {
+        printf 'EZxray: could not query %s; managed files were preserved.\n' "$SERVICE_NAME" >&2
+        return 1
+    }
+    case $active_state in
+        inactive) ;;
+        unknown|"")
+            if [[ -e $SERVICE_PATH || -L $SERVICE_PATH ]]; then
+                systemctl stop "$SERVICE_NAME" || {
+                    printf 'EZxray: could not stop %s; managed files were preserved.\n' "$SERVICE_NAME" >&2
+                    return 1
+                }
+            fi
+            ;;
+        *)
+            systemctl stop "$SERVICE_NAME" || {
+                printf 'EZxray: could not stop %s; managed files were preserved.\n' "$SERVICE_NAME" >&2
+                return 1
+            }
+            ;;
+    esac
+
+    enabled_state=$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)
+    [[ -n $enabled_state ]] || {
+        printf 'EZxray: could not query whether %s is enabled; managed files were preserved.\n' "$SERVICE_NAME" >&2
+        return 1
+    }
+    case $enabled_state in
+        enabled|enabled-runtime|linked|linked-runtime|alias)
+            systemctl disable "$SERVICE_NAME" || {
+                printf 'EZxray: could not disable %s; managed files were preserved.\n' "$SERVICE_NAME" >&2
+                return 1
+            }
+            ;;
+    esac
+}
+
+remove_managed_backups() {
+    local backup_dir backup_name target_name
+    local -a backup_names=(
+        "${XRAY_CONFIG_PATH##*/}"
+        "${PROFILE_PATH##*/}"
+        "${STATE_PATH##*/}"
+        "${MARKER_PATH##*/}"
+        "${SERVICE_PATH##*/}"
+        "${XRAY_BIN##*/}"
+        "${TLS_CERT_MANAGED_PATH##*/}"
+        "${TLS_KEY_MANAGED_PATH##*/}"
+    )
+
+    [[ -d $BACKUP_ROOT && ! -L $BACKUP_ROOT ]] || return 0
+    for backup_dir in "$BACKUP_ROOT"/*; do
+        [[ -d $backup_dir && ! -L $backup_dir ]] || continue
+        backup_name=${backup_dir##*/}
+        [[ $backup_name =~ ^[0-9]{8}T[0-9]{6}-[0-9]+$ ]] || continue
+        for target_name in "${backup_names[@]}"; do
+            if [[ -f $backup_dir/$target_name || -L $backup_dir/$target_name ]]; then
+                rm -f -- "$backup_dir/$target_name" || return 1
+            fi
+        done
+        if ! rmdir -- "$backup_dir" 2>/dev/null; then
+            printf 'EZxray: preserved backup directory containing unrecognized files: %s\n' "$backup_dir"
+        fi
+    done
+    rmdir -- "$BACKUP_ROOT" 2>/dev/null || true
+}
+
+delete_installation() {
+    local confirmation target account_cleanup_safe=true account_entry process_status
+    local -a managed_paths=()
+
+    printf 'Type DELETE to remove the recognized EZxray installation: '
+    if ! IFS= read -r confirmation; then
+        printf '\nDeletion cancelled; no changes were made.\n'
+        return 0
+    fi
+    if [[ $confirmation != DELETE ]]; then
+        printf 'Deletion cancelled; no changes were made.\n'
+        return 0
+    fi
+
+    if ! is_managed_install_marker; then
+        printf 'EZxray: refusing deletion because the managed marker is missing or unrecognized.\n' >&2
+        return 1
+    fi
+    require_systemd
+    if ! validate_managed_delete_targets; then
+        return 1
+    fi
+    if ! service_account_removal_safe; then
+        account_cleanup_safe=false
+        printf 'EZxray: service account or group has changed or unrelated use; it will be preserved.\n'
+    fi
+
+    if ! stop_disable_managed_service; then
+        return 1
+    fi
+
+    account_entry=$(getent passwd "$SERVICE_USER" 2>/dev/null || true)
+    if [[ -n $account_entry ]]; then
+        if ! command -v pgrep >/dev/null 2>&1; then
+            printf 'EZxray: cannot check service-account processes; managed files were preserved.\n' >&2
+            return 1
+        else
+            if pgrep -u "$SERVICE_USER" >/dev/null 2>&1; then
+                printf 'EZxray: a process still runs as %s; managed files were preserved.\n' "$SERVICE_USER" >&2
+                return 1
+            else
+                process_status=$?
+                if ((process_status != 1)); then
+                    printf 'EZxray: could not verify service-account processes; managed files were preserved.\n' >&2
+                    return 1
+                fi
+            fi
+        fi
+    fi
+
+    mapfile -t managed_paths < <(managed_artifact_paths)
+    for target in "${managed_paths[@]}"; do
+        if [[ -f $target || -L $target ]]; then
+            rm -f -- "$target" || return 1
+        fi
+    done
+    remove_managed_backups || return 1
+    rmdir -- "$XRAY_RELEASE_DIR" 2>/dev/null || true
+    rmdir -- "$EZXRAY_DIR" 2>/dev/null || true
+    systemctl daemon-reload || {
+        printf 'EZxray: managed files were removed, but systemd could not reload its unit files.\n' >&2
+        return 1
+    }
+
+    if [[ $account_cleanup_safe == true ]]; then
+        if [[ -n $account_entry ]]; then
+            userdel "$SERVICE_USER" || {
+                printf 'EZxray: managed files were removed, but %s could not be removed.\n' "$SERVICE_USER" >&2
+                return 1
+            }
+        fi
+        if getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
+            groupdel "$SERVICE_GROUP" || {
+                printf 'EZxray: managed files were removed, but %s could not be removed.\n' "$SERVICE_GROUP" >&2
+                return 1
+            }
+        fi
+    fi
+
+    printf 'EZxray managed files, recognized backups, and safe service account/group cleanup are complete. UFW rules were preserved.\n'
+}
+
 parse_arguments() {
     CLI_DOMAIN=""
     CLI_TLS_CERT=""
@@ -716,46 +1176,53 @@ parse_arguments() {
     CLI_PORTS=""
     CLI_PORTS_SET=false
     RECONFIGURE=false
+    STATUS_ONLY=false
+    INSTALL_OPTIONS_SET=false
 
     while (($#)); do
         case $1 in
             --domain)
                 (($# >= 2)) || die "--domain requires a value"
                 CLI_DOMAIN=$2
+                INSTALL_OPTIONS_SET=true
                 shift 2
                 ;;
-            --domain=*) CLI_DOMAIN=${1#*=}; shift ;;
+            --domain=*) CLI_DOMAIN=${1#*=}; INSTALL_OPTIONS_SET=true; shift ;;
             --tls-cert)
                 (($# >= 2)) || die "--tls-cert requires a value"
                 CLI_TLS_CERT=$2
+                INSTALL_OPTIONS_SET=true
                 shift 2
                 ;;
-            --tls-cert=*) CLI_TLS_CERT=${1#*=}; shift ;;
+            --tls-cert=*) CLI_TLS_CERT=${1#*=}; INSTALL_OPTIONS_SET=true; shift ;;
             --tls-key)
                 (($# >= 2)) || die "--tls-key requires a value"
                 CLI_TLS_KEY=$2
+                INSTALL_OPTIONS_SET=true
                 shift 2
                 ;;
-            --tls-key=*) CLI_TLS_KEY=${1#*=}; shift ;;
+            --tls-key=*) CLI_TLS_KEY=${1#*=}; INSTALL_OPTIONS_SET=true; shift ;;
             --ports)
                 (($# >= 2)) || die "--ports requires a comma-separated list"
                 CLI_PORTS=$2
                 CLI_PORTS_SET=true
+                INSTALL_OPTIONS_SET=true
                 shift 2
                 ;;
-            --ports=*) CLI_PORTS=${1#*=}; CLI_PORTS_SET=true; shift ;;
-            --reconfigure) RECONFIGURE=true; shift ;;
+            --ports=*) CLI_PORTS=${1#*=}; CLI_PORTS_SET=true; INSTALL_OPTIONS_SET=true; shift ;;
+            --reconfigure) RECONFIGURE=true; INSTALL_OPTIONS_SET=true; shift ;;
+            --status) STATUS_ONLY=true; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
     done
+
+    if [[ $STATUS_ONLY == true && $INSTALL_OPTIONS_SET == true ]]; then
+        die "--status cannot be combined with install or reconfigure options"
+    fi
 }
 
-main() {
-    set -Eeuo pipefail
-    umask 077
-    parse_arguments "$@"
-
+run_install() {
     if [[ -e $MARKER_PATH || -L $MARKER_PATH ]]; then
         if [[ $RECONFIGURE != true ]]; then
             printf 'EZxray is already marked as installed. No files or services were changed. Use --reconfigure to update it.\n'
@@ -875,6 +1342,22 @@ main() {
     printf 'Automatic port selection excludes 443; explicitly supplied 443 is allowed when free.\n'
     printf 'TLS files are copied into %s; rerun with --reconfigure after renewing the source certificate and key.\n' "$EZXRAY_DIR"
     printf 'No bandwidth shaping is configured; the VPS/provider link remains the speed limit.\n'
+}
+
+main() {
+    set -Eeuo pipefail
+    umask 077
+    parse_arguments "$@"
+
+    if [[ $STATUS_ONLY == true ]]; then
+        show_status
+        return 0
+    fi
+    if (($# == 0)) && is_interactive_tty; then
+        interactive_menu
+        return 0
+    fi
+    run_install
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
