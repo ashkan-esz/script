@@ -43,6 +43,8 @@ On first install, omitted domain and TLS paths are requested interactively.
 Automatic port selection skips 443. An explicitly supplied 443 is accepted
 when it is available. Normal reruns do not change existing files. TLS files are
 copied into EZxray's managed directory; run --reconfigure after certificate renewal.
+UFW rules are added for selected ports plus 443 and 53; existing firewall
+defaults and rules are preserved.
 
 Options:
   --domain DOMAIN       Public DNS name covered by the TLS certificate
@@ -152,6 +154,7 @@ ensure_dependencies() {
     command -v userdel >/dev/null 2>&1 || missing+=(passwd)
     command -v groupdel >/dev/null 2>&1 || missing+=(passwd)
     command -v getent >/dev/null 2>&1 || missing+=(libc-bin)
+    command -v ufw >/dev/null 2>&1 || missing+=(ufw)
     ((${#missing[@]} == 0)) && return 0
 
     command -v apt-get >/dev/null 2>&1 || die "missing dependencies (${missing[*]}) and apt-get is unavailable"
@@ -518,16 +521,125 @@ on_exit() {
     exit "$status"
 }
 
-open_firewall_if_available() {
-    local environment
-    environment=$(systemd-detect-virt --container 2>/dev/null || true)
-    if [[ -n $environment && $environment != none ]]; then
-        printf 'Container detected (%s): configure TCP forwarding for all 12 ports at the VPS host/provider.\n' "$environment"
-        printf 'Also forward UDP for the three Shadowsocks ports: %s %s %s.\n' "${SELECTED_PORTS[9]}" "${SELECTED_PORTS[10]}" "${SELECTED_PORTS[11]}"
-        return 0
+detect_ssh_ports() {
+    local client_ip client_port server_ip connection_port extra config_output key value port
+    local -A seen=()
+    SSH_PORTS=()
+
+    read -r client_ip client_port server_ip connection_port extra <<< "${SSH_CONNECTION:-}"
+    if [[ ${connection_port:-} =~ ^[0-9]{1,5}$ ]]; then
+        port=$((10#$connection_port))
+        if ((port >= 1 && port <= 65535)); then
+            SSH_PORTS+=("$port")
+            seen[$port]=1
+        fi
     fi
-    printf 'EZxray leaves firewall rules unchanged. Open TCP on these ports: %s\n' "${SELECTED_PORTS[*]}"
-    printf 'Also open UDP on the Shadowsocks ports: %s %s %s.\n' "${SELECTED_PORTS[9]}" "${SELECTED_PORTS[10]}" "${SELECTED_PORTS[11]}"
+
+    if command -v sshd >/dev/null 2>&1; then
+        config_output=$(sshd -T 2>/dev/null || true)
+        while read -r key value _; do
+            [[ $key == port && ${value:-} =~ ^[0-9]{1,5}$ ]] || continue
+            port=$((10#$value))
+            ((port >= 1 && port <= 65535)) || continue
+            if [[ -z ${seen[$port]+present} ]]; then
+                SSH_PORTS+=("$port")
+                seen[$port]=1
+            fi
+        done <<< "$config_output"
+    fi
+}
+
+other_firewall_manager_active() {
+    local manager
+    for manager in firewalld.service nftables.service netfilter-persistent.service; do
+        if systemctl is-active --quiet "$manager" >/dev/null 2>&1; then
+            printf 'EZxray: %s is active; leaving UFW inactive to avoid competing firewall managers.\n' "$manager" >&2
+            return 0
+        fi
+    done
+    return 1
+}
+
+open_firewall_if_available() {
+    local environment firewall_status firewall_active=false firewall_failed=false
+    local ssh_rules_ok=true xray_rules_ok=true port protocol
+    local -a ports_to_allow=()
+    local -A seen_ports=()
+
+    environment=$(systemd-detect-virt --container 2>/dev/null || true)
+    if ! firewall_status=$(ufw status 2>/dev/null); then
+        printf 'EZxray: Xray is installed, but UFW status could not be read; firewall rules were not changed.\n' >&2
+        if [[ -n $environment && $environment != none ]]; then
+            printf 'Container detected (%s): verify the host/provider firewall and forwarding for TCP and UDP on the selected ports, 443, and 53.\n' "$environment" >&2
+        fi
+        return 1
+    fi
+    if [[ ${firewall_status,,} == *'status: active'* ]]; then
+        firewall_active=true
+    fi
+
+    # Do not widen SSH access on an already active firewall. Its current SSH
+    # policy is already in force; only add the requested Xray service ports.
+    if [[ $firewall_active != true ]]; then
+        detect_ssh_ports
+        if ((${#SSH_PORTS[@]} == 0)); then
+            printf 'EZxray: could not detect an SSH port; UFW rules will be staged, but UFW will remain inactive to avoid locking out access.\n' >&2
+            firewall_failed=true
+        else
+            for port in "${SSH_PORTS[@]}"; do
+                if ! ufw allow in "$port/tcp" >/dev/null; then
+                    printf 'EZxray: failed to add the SSH allow rule for TCP port %s.\n' "$port" >&2
+                    ssh_rules_ok=false
+                    firewall_failed=true
+                fi
+            done
+        fi
+    fi
+
+    ports_to_allow=("${SELECTED_PORTS[@]}" 443 53)
+    for port in "${ports_to_allow[@]}"; do
+        [[ -z ${seen_ports[$port]+present} ]] || continue
+        seen_ports[$port]=1
+        for protocol in tcp udp; do
+            if ! ufw allow in "$port/$protocol" >/dev/null; then
+                printf 'EZxray: failed to add the %s allow rule for port %s.\n' "$protocol" "$port" >&2
+                xray_rules_ok=false
+                firewall_failed=true
+            fi
+        done
+    done
+
+    if [[ $xray_rules_ok != true ]]; then
+        printf 'EZxray: some requested UFW rules could not be added; review `ufw status`.\n' >&2
+    fi
+
+    if [[ $firewall_active != true ]]; then
+        if ((${#SSH_PORTS[@]} > 0)) && [[ $ssh_rules_ok == true && $xray_rules_ok == true ]]; then
+            if other_firewall_manager_active; then
+                firewall_failed=true
+            else
+                printf 'UFW was inactive; enabling it applies its existing default policy to all inbound traffic. Other services need existing allow rules.\n' >&2
+                if ufw --force enable >/dev/null; then
+                    printf 'UFW is enabled with SSH access allowed first.\n'
+                else
+                    printf 'EZxray: UFW rules were added, but enabling UFW failed; check `ufw status` and the VPS host/provider firewall.\n' >&2
+                    firewall_failed=true
+                fi
+            fi
+        elif ((${#SSH_PORTS[@]} > 0)); then
+            printf 'EZxray: UFW was not enabled because required allow rules could not be confirmed.\n' >&2
+            firewall_failed=true
+        fi
+    fi
+
+    printf 'UFW inbound rules requested: TCP and UDP on the 12 selected ports, plus 443 and 53.\n'
+    if [[ -n $environment && $environment != none ]]; then
+        printf 'Container detected (%s): also permit and forward TCP and UDP on the selected ports, 443, and 53 at the VPS host/provider.\n' "$environment"
+    fi
+    if [[ $firewall_failed == true ]]; then
+        printf 'EZxray is installed, but firewall setup is incomplete; review `ufw status` and rerun with --reconfigure after resolving the issue.\n' >&2
+        return 1
+    fi
 }
 
 reload_service_for_current_mode() {

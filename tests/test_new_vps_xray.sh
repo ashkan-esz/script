@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "$ROOT_DIR/EZxray.sh"
+source "$ROOT_DIR/new_vps_xray.sh"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -101,11 +101,132 @@ for target in "${NOOP_TARGETS[@]}"; do
     cp "$target" "$target.expected"
 done
 systemctl() { fail "ordinary rerun must not call systemctl"; }
+ufw() { fail "ordinary rerun must not change UFW"; }
+apt-get() { fail "ordinary rerun must not install or update packages"; }
 main
 for target in "${NOOP_TARGETS[@]}"; do
     cmp -s "$target" "$target.expected" || fail "ordinary rerun changed $target"
 done
-unset -f systemctl
+unset -f systemctl ufw apt-get
+
+# UFW is installed through the existing Debian/Ubuntu dependency path.
+mkdir -p "$TMP_DIR/mock-bin"
+cat > "$TMP_DIR/mock-bin/apt-get" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >> "$APT_GET_LOG"
+EOF
+chmod +x "$TMP_DIR/mock-bin/apt-get"
+APT_GET_LOG="$TMP_DIR/apt-get.log"
+export APT_GET_LOG
+ORIGINAL_PATH=$PATH
+PATH="$TMP_DIR/mock-bin"
+export PATH
+ensure_dependencies > "$TMP_DIR/dependencies.log"
+PATH=$ORIGINAL_PATH
+export PATH
+[[ "$(< "$APT_GET_LOG")" == *'install -y --no-install-recommends'*'ufw'* ]] || fail "missing UFW must be installed through apt-get"
+
+UFW_LOG="$TMP_DIR/ufw.log"
+TEST_UFW_STATUS=active
+TEST_UFW_FAIL_RULE=
+TEST_UFW_ENABLE_FAIL=false
+TEST_OTHER_FIREWALL_ACTIVE=false
+TEST_VIRT=none
+TEST_SSHD_CONFIG=$'port 2200\nport 2222'
+ufw() {
+    printf '%s\n' "$*" >> "$UFW_LOG"
+    if [[ $1 == status ]]; then
+        printf 'Status: %s\n' "$TEST_UFW_STATUS"
+        return 0
+    fi
+    if [[ $1 == --force && $2 == enable ]]; then
+        [[ $TEST_UFW_ENABLE_FAIL != true ]]
+        return
+    fi
+    [[ ${TEST_UFW_FAIL_RULE:-} != "${3:-}" ]]
+}
+systemd-detect-virt() { printf '%s\n' "$TEST_VIRT"; }
+sshd() { [[ $1 == -T ]] && printf '%s\n' "$TEST_SSHD_CONFIG"; }
+systemctl() {
+    [[ $1 == is-active && ${3:-} == firewalld.service && $TEST_OTHER_FIREWALL_ACTIVE == true ]]
+}
+assert_ufw_log_has() {
+    grep -Fqx -- "$1" "$UFW_LOG" || fail "expected UFW command '$1'"
+}
+assert_ufw_log_lacks() {
+    if grep -Fqx -- "$1" "$UFW_LOG"; then
+        fail "unexpected UFW command '$1'"
+    fi
+}
+assert_firewall_setup_fails() {
+    local output_file=$1 status
+    if open_firewall_if_available > "$output_file" 2>&1; then
+        fail "firewall setup should have returned a failure status"
+    else
+        status=$?
+        [[ $status -eq 1 ]] || fail "firewall setup should return status 1 on incomplete setup"
+    fi
+}
+
+SELECTED_PORTS=(443 8443 8080 2096 2053 2083 2087 2095 8444 8445 8446 8447)
+SSH_CONNECTION='198.51.100.10 51000 203.0.113.4 2222'
+: > "$UFW_LOG"
+open_firewall_if_available > "$TMP_DIR/ufw-active.log"
+for port in "${SELECTED_PORTS[@]}" 53; do
+    assert_ufw_log_has "allow in $port/tcp"
+    assert_ufw_log_has "allow in $port/udp"
+done
+assert_ufw_log_lacks 'allow in 2222/tcp'
+assert_ufw_log_lacks '--force enable'
+assert_ufw_log_lacks 'reset'
+assert_ufw_log_lacks 'default deny incoming'
+[[ $(grep -c '^allow in ' "$UFW_LOG") -eq 26 ]] || fail "active UFW should receive one TCP and UDP rule per unique requested port"
+
+TEST_UFW_STATUS=inactive
+: > "$UFW_LOG"
+open_firewall_if_available > "$TMP_DIR/ufw-inactive.log" 2>&1
+assert_ufw_log_has 'allow in 2222/tcp'
+assert_ufw_log_has 'allow in 2200/tcp'
+assert_ufw_log_has '--force enable'
+[[ "$(< "$TMP_DIR/ufw-inactive.log")" == *'existing default policy to all inbound traffic'* ]] || fail "enabling inactive UFW must warn that existing defaults apply to all inbound traffic"
+SSH_RULE_LINE=$(grep -n -F 'allow in 2222/tcp' "$UFW_LOG" | cut -d: -f1)
+FIRST_XRAY_RULE_LINE=$(grep -n -F 'allow in 443/tcp' "$UFW_LOG" | cut -d: -f1)
+ENABLE_RULE_LINE=$(grep -n -F -- '--force enable' "$UFW_LOG" | cut -d: -f1)
+((SSH_RULE_LINE < FIRST_XRAY_RULE_LINE && FIRST_XRAY_RULE_LINE < ENABLE_RULE_LINE)) || fail "SSH must be allowed before Xray rules and UFW activation"
+
+unset SSH_CONNECTION
+TEST_SSHD_CONFIG=
+: > "$UFW_LOG"
+assert_firewall_setup_fails "$TMP_DIR/ufw-no-ssh.log"
+assert_ufw_log_lacks '--force enable'
+[[ "$(< "$TMP_DIR/ufw-no-ssh.log")" == *'UFW will remain inactive'* ]] || fail "unknown SSH port must prevent enabling UFW"
+assert_ufw_log_has 'allow in 53/tcp'
+assert_ufw_log_has 'allow in 53/udp'
+
+SSH_CONNECTION='198.51.100.10 51000 203.0.113.4 2222'
+TEST_UFW_FAIL_RULE=53/udp
+: > "$UFW_LOG"
+assert_firewall_setup_fails "$TMP_DIR/ufw-rule-fail.log"
+assert_ufw_log_lacks '--force enable'
+[[ "$(< "$TMP_DIR/ufw-rule-fail.log")" == *'some requested UFW rules could not be added'* ]] || fail "UFW must not enable when requested rules fail"
+
+TEST_UFW_FAIL_RULE=
+TEST_UFW_ENABLE_FAIL=true
+TEST_VIRT=lxc
+: > "$UFW_LOG"
+assert_firewall_setup_fails "$TMP_DIR/ufw-lxc-fail.log"
+assert_ufw_log_has '--force enable'
+[[ "$(< "$TMP_DIR/ufw-lxc-fail.log")" == *'enabling UFW failed'* ]] || fail "failed UFW activation must be reported"
+[[ "$(< "$TMP_DIR/ufw-lxc-fail.log")" == *'host/provider'* ]] || fail "container must report host/provider firewall requirements"
+
+TEST_UFW_ENABLE_FAIL=false
+TEST_VIRT=none
+TEST_OTHER_FIREWALL_ACTIVE=true
+: > "$UFW_LOG"
+assert_firewall_setup_fails "$TMP_DIR/ufw-other-manager.log"
+assert_ufw_log_lacks '--force enable'
+[[ "$(< "$TMP_DIR/ufw-other-manager.log")" == *'avoid competing firewall managers'* ]] || fail "another active firewall manager must prevent enabling UFW"
+unset -f ufw systemd-detect-virt sshd
 
 DOMAIN="vpn.example.test"
 TLS_CERT="/etc/ssl/example/fullchain.pem"
