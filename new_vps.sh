@@ -63,9 +63,18 @@ curl -Ls https://raw.githubusercontent.com/ashkan-esz/script/main/master_dns_g69
 echo "[+] Installing master dns vpn script (c.g69.lol)"
 bash <(curl -Ls https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh) --version v2026.04.05.191930-7757d2d
 
-echo "[+] Installing EZxray_Direct_Server"
-bash <(curl -s https://raw.githubusercontent.com/greencolor7676/EZxray_Direct_Server/main/EZxray.sh)
-cat /root/xray-configs-12-protocols.txt
+echo "[+] Installing new_vps_xray.sh"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || {
+  echo "[!] Could not determine the directory containing new_vps.sh" >&2
+  exit 1
+}
+XRAY_INSTALLER="$SCRIPT_DIR/new_vps_xray.sh"
+if [[ ! -f $XRAY_INSTALLER ]]; then
+  echo "[!] Missing local Xray installer: $XRAY_INSTALLER" >&2
+  echo "    Keep new_vps.sh and new_vps_xray.sh in the same directory." >&2
+  exit 1
+fi
+bash "$XRAY_INSTALLER"
 
 
 echo "[+] Configuring SSH reverse tunneling..."
