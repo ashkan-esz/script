@@ -16,7 +16,8 @@ SYSCTL_IPV6_FILE="/etc/sysctl.d/99-disable-ipv6.conf"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 ENCRYPT_KEY_FILE="/root/encrypt_key.txt"
 MASTERDNS_CONFIG_FILE="/root/server_config.toml"
-XRAY_INSTALLER="https://raw.githubusercontent.com/ashkan-esz/script/main/new_vps_xray.sh"
+XRAY_INSTALLER_URL="https://raw.githubusercontent.com/ashkan-esz/script/main/new_vps_xray.sh"
+XRAY_INSTALLER="$SCRIPT_DIR/new_vps_xray.sh"
 
 SSH_BLOCK_BEGIN="# BEGIN new_vps.sh managed SSH settings"
 SSH_BLOCK_END="# END new_vps.sh managed SSH settings"
@@ -108,13 +109,11 @@ preflight() {
     has_interactive_terminal ||
         die "a terminal is required because the Xray installer is invoked without arguments"
 
-    [[ -f $XRAY_INSTALLER && -r $XRAY_INSTALLER ]] ||
-        die "missing local Xray installer: $XRAY_INSTALLER"
     [[ -f $SSHD_CONFIG && ! -L $SSHD_CONFIG && -r $SSHD_CONFIG ]] ||
         die "SSH configuration is missing, unreadable, or not a regular file: $SSHD_CONFIG"
 
     require_command \
-        id apt-get systemctl sshd bash mktemp install awk chmod chown cp mv rm dirname \
+        id apt-get systemctl sshd bash mktemp install awk chmod chown cp mv rm dirname curl \
         useradd chpasswd sysctl
     detect_ssh_service
 
@@ -174,6 +173,16 @@ download_file() {
 
     curl --fail --silent --show-error --location --retry 3 \
         --connect-timeout 15 --output "$destination" "$url"
+}
+
+prepare_xray_installer() {
+    [[ -f $XRAY_INSTALLER && -r $XRAY_INSTALLER ]] && return 0
+
+    XRAY_INSTALLER="$TEMP_DIR/new_vps_xray.sh"
+    printf '[+] Downloading Xray installer\n'
+    download_file "$XRAY_INSTALLER_URL" "$XRAY_INSTALLER" ||
+        die "downloading the Xray installer failed"
+    [[ -s $XRAY_INSTALLER ]] || die "the downloaded Xray installer is empty"
 }
 
 install_masterdns() {
@@ -361,6 +370,7 @@ main() {
     preflight "$@"
 
     TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/new-vps.XXXXXXXX")"
+    prepare_xray_installer
     run_setup
 }
 
