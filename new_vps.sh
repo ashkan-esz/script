@@ -107,7 +107,7 @@ preflight() {
     is_root || die "run this script as root"
     validate_port
     has_interactive_terminal ||
-        die "a terminal is required because the Xray installer is invoked without arguments"
+        die "a terminal is required for interactive Xray setup"
 
     [[ -f $SSHD_CONFIG && ! -L $SSHD_CONFIG && -r $SSHD_CONFIG ]] ||
         die "SSH configuration is missing, unreadable, or not a regular file: $SSHD_CONFIG"
@@ -289,15 +289,11 @@ configure_ssh() {
 }
 
 run_xray_installer() {
-    local status_output
-
     printf '[+] Installing new_vps_xray.sh\n'
-    run_required "running the Xray installer" bash "$XRAY_INSTALLER"
-    if ! status_output="$(bash "$XRAY_INSTALLER" --status)"; then
-        die "could not verify Xray installation status"
+    printf '[+] After Xray setup completes, choose 6 (Exit) to continue this setup\n'
+    if ! bash "$XRAY_INSTALLER"; then
+        printf '[!] Xray installer failed; continuing setup anyway\n' >&2
     fi
-    [[ $status_output == *$'Installation: installed'* ]] ||
-        die "the Xray menu returned without a valid managed installation"
 }
 
 configure_ufw_port() {

@@ -203,13 +203,11 @@ fi
 [[ ${XRAY_CHILD_FAIL:-0} != 1 ]] || exit 23
 CHILD
 run_xray_installer
-assert_eq "$(< "$XRAY_CHILD_LOG")" $'\n--status' "Xray should retain its no-argument menu invocation and verify status afterward"
-if ( export XRAY_CHILD_FAIL=1; run_xray_installer ) > "$TMP_DIR/xray-child-failure" 2>&1; then
-    fail "a failed Xray child should fail the parent step"
+assert_eq "$(< "$XRAY_CHILD_LOG")" $'\n' "Xray should retain its no-argument menu invocation"
+if ! ( export XRAY_CHILD_FAIL=1; run_xray_installer ) > "$TMP_DIR/xray-child-failure" 2>&1; then
+    fail "a failed Xray child should not stop the parent setup"
 fi
-if ( export XRAY_TEST_STATUS='not installed'; run_xray_installer ) > "$TMP_DIR/xray-not-installed" 2>&1; then
-    fail "Xray menu exit without an installation should be rejected"
-fi
+assert_contains "$(< "$TMP_DIR/xray-child-failure")" "continuing setup anyway" "Xray failures should be reported as warnings"
 
 SSH_ORIGINAL="$(< "$SSHD_CONFIG")"
 configure_ssh
