@@ -1342,6 +1342,21 @@ run_install() {
     printf 'Automatic port selection excludes 443; explicitly supplied 443 is allowed when free.\n'
     printf 'TLS files are copied into %s; rerun with --reconfigure after renewing the source certificate and key.\n' "$EZXRAY_DIR"
     printf 'No bandwidth shaping is configured; the VPS/provider link remains the speed limit.\n'
+    print_profiles
+}
+
+print_profiles() {
+    local protocol profile
+
+    printf '\nClient configurations (12 total)\n'
+    printf '%s\n' '================================'
+    for protocol in VLESS VMess Trojan Shadowsocks; do
+        printf '\n%s\n' "$protocol"
+        while IFS= read -r profile; do
+            [[ $profile == "$protocol "* ]] || continue
+            printf '  %s\n    %s\n' "${profile%%:*}" "${profile#*: }"
+        done < "$PROFILE_PATH"
+    done
 }
 
 main() {

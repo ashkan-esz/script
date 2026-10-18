@@ -103,7 +103,8 @@ done
 systemctl() { fail "ordinary rerun must not call systemctl"; }
 ufw() { fail "ordinary rerun must not change UFW"; }
 apt-get() { fail "ordinary rerun must not install or update packages"; }
-main
+NOOP_OUTPUT="$(main)"
+[[ $NOOP_OUTPUT != *'Client configurations'* ]] || fail "ordinary rerun must not print client configs"
 for target in "${NOOP_TARGETS[@]}"; do
     cmp -s "$target" "$target.expected" || fail "ordinary rerun changed $target"
 done
@@ -239,6 +240,28 @@ SS_PASSWORDS=(shadowsocks-one shadowsocks-two shadowsocks-three)
 
 write_render_spec "$TMP_DIR/spec"
 render_artifacts "$TMP_DIR/config.json" "$TMP_DIR/profiles.txt" "$TMP_DIR/state.json" "$TMP_DIR/spec"
+PROFILE_PATH="$TMP_DIR/profiles.txt"
+print_profiles > "$TMP_DIR/printed-profiles.txt"
+python3 - "$TMP_DIR/profiles.txt" "$TMP_DIR/printed-profiles.txt" <<'PY'
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    profiles = [line.rstrip("\n") for line in source]
+with open(sys.argv[2], encoding="utf-8") as source:
+    printed = source.read()
+
+protocols = ("VLESS", "VMess", "Trojan", "Shadowsocks")
+assert "Client configurations (12 total)" in printed
+assert len(profiles) == 12
+for protocol in protocols:
+    assert f"\n{protocol}\n" in printed
+for profile in profiles:
+    label, link = profile.split(": ", 1)
+    assert f"  {label}\n    {link}\n" in printed, label
+links = re.findall(r"^    (?:vless|vmess|trojan|ss)://\S+$", printed, re.MULTILINE)
+assert len(links) == 12, len(links)
+PY
 
 python3 - "$TMP_DIR/config.json" <<'PY'
 import json
@@ -653,5 +676,96 @@ if delete_installation < "$TMP_DIR/delete-symlink-parent-input" > "$TMP_DIR/dele
 fi
 [[ -f $MARKER_PATH && "$(< "$STATE_PATH")" == 'preserve redirected state' ]] || fail "symlinked managed directory contents were changed"
 [[ ! -s $CONTROL_SYSTEMCTL_LOG ]] || fail "symlinked managed directory must be refused before changing service state"
+
+test_install_profile_output() (
+    local root="$TMP_DIR/profile-output"
+    EZXRAY_DIR="$root/etc/ezxray"
+    STATE_PATH="$EZXRAY_DIR/state.json"
+    MARKER_PATH="$EZXRAY_DIR/managed"
+    TLS_CERT_MANAGED_PATH="$EZXRAY_DIR/fullchain.pem"
+    TLS_KEY_MANAGED_PATH="$EZXRAY_DIR/privkey.pem"
+    BACKUP_ROOT="$EZXRAY_DIR/backups"
+    XRAY_CONFIG_PATH="$root/usr/local/xray/config.json"
+    XRAY_RELEASE_DIR="$root/usr/local/lib/ezxray/$EZXRAY_VERSION"
+    XRAY_BIN="$XRAY_RELEASE_DIR/xray"
+    PROFILE_PATH="$root/root/xray-configs-12-protocols.txt"
+    SERVICE_PATH="$root/systemd/ezxray.service"
+    CLI_DOMAIN="vpn.example.test"
+    CLI_TLS_CERT="$root/source/fullchain.pem"
+    CLI_TLS_KEY="$root/source/privkey.pem"
+    CLI_PORTS_SET=false
+    RECONFIGURE=false
+    SERVICE_WAS_ACTIVE=false
+    SELECTED_PORTS=(443 8443 8080 2096 2053 2083 2087 2095 8444 8445 8446 8447)
+    VLESS_UUIDS=(11111111-1111-4111-8111-111111111111 22222222-2222-4222-8222-222222222222 33333333-3333-4333-8333-333333333333)
+    VMESS_UUIDS=(44444444-4444-4444-8444-444444444444 55555555-5555-4555-8555-555555555555 66666666-6666-4666-8666-666666666666)
+    TROJAN_PASSWORDS=(trojan-one trojan-two trojan-three)
+    SS_PASSWORDS=(shadowsocks-one shadowsocks-two shadowsocks-three)
+    mkdir -p "$root/source" "$XRAY_RELEASE_DIR"
+    printf 'test certificate\n' > "$CLI_TLS_CERT"
+    printf 'test private key\n' > "$CLI_TLS_KEY"
+    printf '#!/bin/sh\nexit 0\n' > "$XRAY_BIN"
+    chmod 0755 "$XRAY_BIN"
+
+    require_systemd() { :; }
+    has_unmanaged_collision() { return 1; }
+    ensure_dependencies() { :; }
+    validate_tls_files() { :; }
+    validate_service_account() { :; }
+    port_is_available() { return 0; }
+    select_automatic_ports() { :; }
+    generate_credentials() { :; }
+    ensure_service_account() { :; }
+    service_is_active() { return 1; }
+    service_is_enabled() { return 1; }
+    save_backup() { :; }
+    reload_service_for_current_mode() { :; }
+    open_firewall_if_available() { :; }
+    install() {
+        local -a args=()
+        while (($#)); do
+            case "$1" in
+                -o|-g) shift 2 ;;
+                *) args+=("$1"); shift ;;
+            esac
+        done
+        command install "${args[@]}"
+    }
+
+    assert_profiles_printed() {
+        local output_path=$1
+        python3 - "$PROFILE_PATH" "$output_path" <<'PY'
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    profiles = [line.rstrip("\n") for line in source]
+with open(sys.argv[2], encoding="utf-8") as source:
+    printed = source.read()
+
+assert len(profiles) == 12
+assert "No bandwidth shaping is configured" in printed
+assert printed.index("No bandwidth shaping is configured") < printed.index("Client configurations (12 total)")
+for profile in profiles:
+    label, link = profile.split(": ", 1)
+    assert printed.count(link) == 1, label
+    assert f"  {label}\n    {link}\n" in printed, label
+assert printed.rstrip().endswith(profiles[-1].split(": ", 1)[1])
+PY
+    }
+
+    FIRST_OUTPUT="$(run_install)"
+    [[ $FIRST_OUTPUT == *'EZxray is active. Generated 12 profiles:'* ]] || fail "first install should report its active service"
+    [[ $FIRST_OUTPUT == *'Client configurations (12 total)'* ]] || fail "first install should print all client profiles"
+    printf '%s\n' "$FIRST_OUTPUT" > "$root/first-output.txt"
+    assert_profiles_printed "$root/first-output.txt"
+
+    RECONFIGURE=true
+    RECONFIGURE_OUTPUT="$(run_install)"
+    [[ $RECONFIGURE_OUTPUT == *'previously inactive service remains stopped'* ]] || fail "reconfigure should preserve an inactive service"
+    [[ $RECONFIGURE_OUTPUT == *'Client configurations (12 total)'* ]] || fail "reconfigure should print all client profiles"
+    printf '%s\n' "$RECONFIGURE_OUTPUT" > "$root/reconfigure-output.txt"
+    assert_profiles_printed "$root/reconfigure-output.txt"
+)
+test_install_profile_output
 
 printf 'PASS: EZxray config, ports, rerun, service-state, and rollback checks\n'
