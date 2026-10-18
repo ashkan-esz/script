@@ -132,10 +132,9 @@ install_base_packages() {
     printf '[+] Updating system\n'
     run_required "apt-get update" apt-get update
     run_required "base package installation" apt-get install -y \
-        ca-certificates curl gnupg unzip htop make sudo \
-        iptables-persistent
+        ca-certificates curl gnupg unzip htop make sudo ufw
 
-    require_command curl sysctl iptables netfilter-persistent useradd chpasswd sshd
+    require_command curl sysctl iptables ufw useradd chpasswd sshd
 }
 
 write_sysctl_settings() {
@@ -339,8 +338,8 @@ run_setup() {
     run_required "writing sysctl settings" write_sysctl_settings
     run_required "applying sysctl settings" sysctl --system
 
-    STEP="saving the TCP MSS rule"
-    run_required "configuring TCP MSS clamping" configure_mss_clamping
+#    STEP="saving the TCP MSS rule"
+#    run_required "configuring TCP MSS clamping" configure_mss_clamping
 
     STEP="disabling optional services"
     run_required "disabling optional services" disable_optional_services
