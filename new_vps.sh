@@ -18,6 +18,7 @@ ENCRYPT_KEY_FILE="/root/encrypt_key.txt"
 MASTERDNS_CONFIG_FILE="/root/server_config.toml"
 XRAY_INSTALLER_URL="https://raw.githubusercontent.com/ashkan-esz/script/main/new_vps_xray.sh"
 XRAY_INSTALLER="$SCRIPT_DIR/new_vps_xray.sh"
+PROJECTS_INSTALLER="$SCRIPT_DIR/new_vps_projects/new_vps_projects.sh"
 
 SSH_BLOCK_BEGIN="# BEGIN new_vps.sh managed SSH settings"
 SSH_BLOCK_END="# END new_vps.sh managed SSH settings"
@@ -26,6 +27,7 @@ TEMP_DIR=""
 SSH_BACKUP=""
 SSH_TEMP_FILE=""
 SSH_SERVICE_UNIT=""
+INSTALL_PROJECTS=0
 
 die() {
     printf '[!] %s: %s\n' "$STEP" "$*" >&2
@@ -322,6 +324,31 @@ configure_ufw_port() {
     esac
 }
 
+ask_install_projects() {
+    local answer
+
+    while true; do
+        printf '[?] Install a container engine for projects after server setup? [y/N]: '
+        if ! IFS= read -r answer; then
+            die "could not read the project installation choice"
+        fi
+
+        case "$answer" in
+            [Yy]|[Yy][Ee][Ss])
+                INSTALL_PROJECTS=1
+                return 0
+                ;;
+            ""|[Nn]|[Nn][Oo])
+                INSTALL_PROJECTS=0
+                return 0
+                ;;
+            *)
+                printf '[!] Please answer yes or no.\n' >&2
+                ;;
+        esac
+    done
+}
+
 run_setup() {
     STEP="creating the gang user"
     run_required "creating the gang user" create_gang_user
@@ -351,6 +378,13 @@ run_setup() {
     STEP="configuring the reverse-tunnel firewall rule"
     run_required "configuring the reverse-tunnel firewall rule" configure_ufw_port
 
+    if ((INSTALL_PROJECTS)); then
+        STEP="installing project container engine"
+        [[ -f $PROJECTS_INSTALLER && -r $PROJECTS_INSTALLER ]] ||
+            die "project installer is missing or unreadable: $PROJECTS_INSTALLER"
+        run_required "project installer" bash "$PROJECTS_INSTALLER"
+    fi
+
     printf '[✓] Server setup complete\n'
     printf '[+] Better to change the password\n'
 }
@@ -363,6 +397,9 @@ main() {
 
     STEP="preflight checks"
     preflight "$@"
+
+    STEP="project installation choice"
+    ask_install_projects
 
     TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/new-vps.XXXXXXXX")"
     prepare_xray_installer

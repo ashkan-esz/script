@@ -8,6 +8,16 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TMP_DIR"' EXIT
 COMMAND_LOG="$TMP_DIR/commands.log"
 : > "$COMMAND_LOG"
+PROJECTS_INSTALLER="$TMP_DIR/projects-installer.sh"
+PROJECTS_CHILD_LOG="$TMP_DIR/projects-child.log"
+export PROJECTS_CHILD_LOG
+
+cat > "$PROJECTS_INSTALLER" <<'CHILD'
+#!/usr/bin/env bash
+printf 'projects-installer\n' >> "$PROJECTS_CHILD_LOG"
+printf '[mock] projects installer finished\n'
+[[ ${PROJECTS_CHILD_FAIL:-0} != 1 ]] || exit 43
+CHILD
 
 fail() {
     printf 'FAIL: %s\n' "$1" >&2
@@ -203,7 +213,7 @@ fi
 [[ ${XRAY_CHILD_FAIL:-0} != 1 ]] || exit 23
 CHILD
 run_xray_installer
-assert_eq "$(< "$XRAY_CHILD_LOG")" $'\n' "Xray should retain its no-argument menu invocation"
+assert_eq "$(wc -c < "$XRAY_CHILD_LOG")" "1" "Xray should retain its no-argument menu invocation"
 if ! ( export XRAY_CHILD_FAIL=1; run_xray_installer ) > "$TMP_DIR/xray-child-failure" 2>&1; then
     fail "a failed Xray child should not stop the parent setup"
 fi
@@ -257,16 +267,46 @@ run_mocked_main() (
     TEST_HAS_TTY=1
     SSHD_CONFIG="$TMP_DIR/main_sshd_config"
     XRAY_INSTALLER="$TMP_DIR/main_xray_installer"
+    PROJECTS_INSTALLER="$PROJECTS_INSTALLER"
     printf 'Port 22\n' > "$SSHD_CONFIG"
     printf '#!/usr/bin/env bash\nexit 0\n' > "$XRAY_INSTALLER"
-    main
+    main <<< "${PROJECTS_RESPONSE-n}"
 )
 
 : > "$COMMAND_LOG"
+rm -f -- "$PROJECTS_CHILD_LOG"
 if ! SUCCESS_OUTPUT="$(run_mocked_main 2>&1)"; then
     fail "mocked full setup should succeed: $SUCCESS_OUTPUT"
 fi
 assert_contains "$SUCCESS_OUTPUT" "Server setup complete" "successful setup should report completion"
+[[ ! -e $PROJECTS_CHILD_LOG ]] || fail "declining project installation should skip the installer"
+
+: > "$COMMAND_LOG"
+rm -f -- "$PROJECTS_CHILD_LOG"
+if ! SUCCESS_OUTPUT="$(PROJECTS_RESPONSE='' run_mocked_main 2>&1)"; then
+    fail "a blank project choice should use the default and succeed: $SUCCESS_OUTPUT"
+fi
+[[ ! -e $PROJECTS_CHILD_LOG ]] || fail "blank project choice should default to skipping the installer"
+
+: > "$COMMAND_LOG"
+rm -f -- "$PROJECTS_CHILD_LOG"
+if ! SUCCESS_OUTPUT="$(PROJECTS_RESPONSE=y run_mocked_main 2>&1)"; then
+    fail "setup with project installation selected should succeed: $SUCCESS_OUTPUT"
+fi
+assert_eq "$(< "$PROJECTS_CHILD_LOG")" "projects-installer" "accepting project installation should run the installer"
+[[ $SUCCESS_OUTPUT == *"[mock] projects installer finished"*"Server setup complete"* ]] ||
+    fail "the project installer should finish before setup reports completion"
+
+: > "$COMMAND_LOG"
+rm -f -- "$PROJECTS_CHILD_LOG"
+if (PROJECTS_RESPONSE=y PROJECTS_CHILD_FAIL=1 run_mocked_main) > "$TMP_DIR/projects-failure-output" 2>&1; then
+    fail "a failed project installer should stop the setup"
+fi
+PROJECTS_FAILURE_OUTPUT="$(< "$TMP_DIR/projects-failure-output")"
+assert_contains "$PROJECTS_FAILURE_OUTPUT" "failed during installing project container engine" "project failure should identify its stage"
+if [[ $PROJECTS_FAILURE_OUTPUT == *"Server setup complete"* ]]; then
+    fail "failed project installation must not print the completion message"
+fi
 
 : > "$COMMAND_LOG"
 if ( FAIL_STAGE=install_masterdns; run_mocked_main ) > "$TMP_DIR/stopped-output" 2>&1; then
@@ -281,4 +321,4 @@ if [[ $(< "$COMMAND_LOG") == *"stage run_xray_installer"* ]]; then
     fail "setup should not continue after a failed MasterDNS stage"
 fi
 
-printf 'PASS: new_vps preflight, downloads, Xray status, SSH rollback, UFW, and failure propagation\n'
+printf 'PASS: new_vps preflight, downloads, Xray status, SSH rollback, UFW, project choice, and failure propagation\n'
