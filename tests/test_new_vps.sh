@@ -130,9 +130,16 @@ assert_eq "$PORT" "80" "PORT should be normalized as a decimal number"
 if ( PORT=65536; validate_port ) > "$TMP_DIR/invalid-port" 2>&1; then
     fail "PORT above 65535 should be rejected"
 fi
-if ( unset PORT; validate_port ) > "$TMP_DIR/missing-port" 2>&1; then
-    fail "missing PORT should be rejected"
-fi
+(
+    unset PORT
+    validate_port
+    assert_eq "$PORT" "6060" "unset PORT should default to 6060"
+)
+(
+    PORT=
+    validate_port
+    assert_eq "$PORT" "6060" "empty PORT should default to 6060"
+)
 
 SSHD_CONFIG="$TMP_DIR/sshd_config"
 XRAY_INSTALLER="$TMP_DIR/new_vps_xray.sh"

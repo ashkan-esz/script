@@ -74,11 +74,11 @@ has_interactive_terminal() {
 }
 
 validate_port() {
-    local supplied_port=${PORT:-}
+    local supplied_port=${PORT:-6060}
     local numeric_port
 
     [[ $supplied_port =~ ^[0-9]{1,5}$ ]] ||
-        die "set PORT to a TCP port from 1 through 65535 before running this script"
+        die "PORT must be a TCP port from 1 through 65535"
 
     numeric_port=$((10#$supplied_port))
     ((numeric_port >= 1 && numeric_port <= 65535)) ||
