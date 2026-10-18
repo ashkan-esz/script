@@ -1,0 +1,59 @@
+services:
+  crab-dump:
+    image: ghcr.io/ashkan-esz/crab-dump
+    network_mode: host
+    privileged: true
+    env_file:
+      - ./crab_dump.env
+    environment:
+      API_PORT: "1101"
+      DASHBOARD_HOST: "0.0.0.0"
+      HISTORY_DIR: /app/history
+      WORK_DIR: /app/work
+      MAX_PARALLEL_DATABASES: "1"
+      CHUNK_SIZE_MB: "49"
+      BACKUP_INTERVAL: "0 */4 * * *"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - crab_dump_history:/app/history
+      - crab_dump_data:/app/data
+      - crab_dump_temp:/app/tmp
+    restart: unless-stopped
+    cpus: "0.20"
+    mem_limit: "50mb"
+    memswap_limit: "50mb"
+    
+  slowmeet:
+    image: ghcr.io/ashkan-esz/slowmeet
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - ./slow_meet.env
+    environment:
+      APP_ENV: "production"
+      HTTP_ADDR: ":8080"
+      HTTP_PUBLISH_ADDRESS: "0.0.0.0"
+      HTTP_PUBLISH_PORT: "1102"
+      CONFIG_FILE: data/config.json
+    ports:
+      - "0.0.0.0:8080:8080/tcp"
+      - "50000-50100:50000-50100/udp"
+    volumes:
+      - slow_meet_data:/app/data
+    restart: unless-stopped
+    cpus: "0.70"
+    mem_limit: "500mb"
+    memswap_limit: "500mb"
+
+volumes:
+  crab_dump_history:
+  crab_dump_data:
+  crab_dump_temp:
+  slow_meet_data:

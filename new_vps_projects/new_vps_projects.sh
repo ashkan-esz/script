@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly PROJECTS_DIR="${PROJECTS_DIR:-/opt/vps-projects}"
+readonly COMPOSE_TEMPLATE="$SCRIPT_DIR/compose.yaml"
+readonly CRAB_DUMP_ENV_TEMPLATE="$SCRIPT_DIR/crab_dump.sample.env"
+readonly SLOW_MEET_ENV_TEMPLATE="$SCRIPT_DIR/slow_meet.sample.env"
+
 readonly DOCKER_KEYRING_DIR="/etc/apt/keyrings"
 readonly DOCKER_KEY_FILE="${DOCKER_KEYRING_DIR}/docker.asc"
 readonly DOCKER_SOURCE_FILE="/etc/apt/sources.list.d/docker.sources"
@@ -24,7 +30,7 @@ require_command() {
 
 preflight() {
     (($# == 0)) || die "this script takes no arguments"
-    require_command id apt-get
+    require_command id apt-get install chmod
     [[ $(id -u) == 0 ]] || die "run this script as root"
     [[ -t 0 ]] || die "a terminal is required to choose Docker or Podman"
     [[ -r /etc/os-release ]] || die "could not read /etc/os-release"
@@ -78,6 +84,8 @@ install_docker() {
     run_required "updating apt package lists for Docker" apt-get update
     run_required "installing Docker Engine, Buildx, and Compose" apt-get install -y \
         docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    require_command docker
+    docker compose version >/dev/null || die "Docker Compose v2 is unavailable after installation"
     if command -v systemctl >/dev/null 2>&1; then
         run_required "enabling and starting Docker" systemctl enable --now docker
     fi
@@ -87,8 +95,50 @@ install_docker() {
 install_podman() {
     printf '[+] Installing Podman from the %s apt repository\n' "$ID"
     run_required "updating apt package lists" apt-get update
-    run_required "installing Podman" apt-get install -y podman
-    printf '[+] Podman is installed.\n'
+    run_required "installing Podman and its Compose provider" apt-get install -y podman podman-compose
+    require_command podman podman-compose
+    printf '[+] Podman and podman-compose are installed.\n'
+}
+
+copy_project_file_if_missing() {
+    local source="$1" destination="$2" mode="$3" description="$4"
+
+    [[ -f $source && ! -L $source && -r $source ]] ||
+        die "$description template is missing, unreadable, or not a regular file: $source"
+
+    if [[ -e $destination || -L $destination ]]; then
+        [[ -f $destination && ! -L $destination ]] ||
+            die "$description destination is not a regular file: $destination"
+        if [[ $mode == 0600 ]]; then
+            run_required "restricting permissions on $destination" chmod 0600 -- "$destination"
+        fi
+        printf '[+] Preserving existing %s: %s\n' "$description" "$destination"
+        return 0
+    fi
+
+    run_required "copying $description" install -m "$mode" -- "$source" "$destination"
+}
+
+prepare_project_stack() {
+    [[ ! -L $PROJECTS_DIR ]] || die "projects directory must not be a symlink: $PROJECTS_DIR"
+    [[ ! -e $PROJECTS_DIR || -d $PROJECTS_DIR ]] ||
+        die "projects path exists and is not a directory: $PROJECTS_DIR"
+    run_required "creating projects directory" install -d -m 0750 -- "$PROJECTS_DIR"
+
+    copy_project_file_if_missing "$COMPOSE_TEMPLATE" "$PROJECTS_DIR/compose.yaml" 0644 "Compose file"
+    copy_project_file_if_missing "$CRAB_DUMP_ENV_TEMPLATE" "$PROJECTS_DIR/crab_dump.env" 0600 "Crab Dump environment"
+    copy_project_file_if_missing "$SLOW_MEET_ENV_TEMPLATE" "$PROJECTS_DIR/slow_meet.env" 0600 "SlowMeet environment"
+
+    printf '\n[+] Project configuration is staged in %s; containers were not started.\n' "$PROJECTS_DIR"
+    printf '[!] Replace the placeholder values in crab_dump.env and slow_meet.env before starting the stack.\n'
+    printf '[!] SlowMeet needs inbound TCP 8080 and UDP 50000-50100 when exposed; firewall rules were left unchanged.\n'
+    printf '[!] This container-only setup does not configure a reverse proxy or TLS.\n'
+    printf '[+] After editing the environment files, run from %s:\n' "$PROJECTS_DIR"
+    case "${ENGINE_CHOICE:-}" in
+        docker) printf '    docker compose up -d\n' ;;
+        podman) printf '    podman-compose up -d\n' ;;
+        *) die "choose Docker or Podman before preparing projects" ;;
+    esac
 }
 
 install_selected_engine() {
@@ -97,6 +147,7 @@ install_selected_engine() {
         podman) install_podman ;;
         *) die "choose Docker or Podman before installing an engine" ;;
     esac
+    prepare_project_stack
 }
 
 main() {
