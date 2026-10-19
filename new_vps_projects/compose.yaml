@@ -26,6 +26,7 @@ services:
     
   slowmeet:
     image: ghcr.io/ashkan-esz/slowmeet
+    network_mode: host
     init: true
     read_only: true
     tmpfs:
@@ -42,9 +43,6 @@ services:
       HTTP_PUBLISH_ADDRESS: "0.0.0.0"
       HTTP_PUBLISH_PORT: "1102"
       CONFIG_FILE: data/config.json
-    ports:
-      - "0.0.0.0:8080:8080/tcp"
-      - "50000-50100:50000-50100/udp"
     volumes:
       - slow_meet_data:/app/data
     restart: unless-stopped
