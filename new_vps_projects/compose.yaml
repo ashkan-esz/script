@@ -55,6 +55,20 @@ services:
     mem_limit: "500mb"
     memswap_limit: "500mb"
 
+  nginx:
+    image: nginx
+    network_mode: host
+    profiles:
+      - public
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./acme-webroot:/var/www/letsencrypt:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    restart: unless-stopped
+    cpus: "0.20"
+    mem_limit: "100mb"
+    memswap_limit: "200mb"
+
 volumes:
   crab_dump_history:
   crab_dump_data:

@@ -1,4 +1,5 @@
 [Unit]
+# Managed by new_vps_projects.sh
 Description=VPS projects Podman Compose stack
 Wants=network-online.target
 After=network-online.target

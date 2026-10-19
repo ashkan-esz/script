@@ -10,6 +10,11 @@ readonly PODMAN_SERVICE_TEMPLATE="$SCRIPT_DIR/podman-compose.service"
 readonly DOCKER_KEYRING_DIR="/etc/apt/keyrings"
 readonly DOCKER_KEY_FILE="${DOCKER_KEYRING_DIR}/docker.asc"
 readonly DOCKER_SOURCE_FILE="/etc/apt/sources.list.d/docker.sources"
+readonly NGINX_CONFIG_FILE="${NGINX_CONFIG_FILE:-${PROJECTS_DIR}/nginx.conf}"
+readonly ACME_WEBROOT="${ACME_WEBROOT:-${PROJECTS_DIR}/acme-webroot}"
+readonly LETSENCRYPT_DIR="${LETSENCRYPT_DIR:-/etc/letsencrypt}"
+readonly CERTBOT_DEPLOY_HOOK_DIR="${CERTBOT_DEPLOY_HOOK_DIR:-${LETSENCRYPT_DIR}/renewal-hooks/deploy}"
+readonly MANAGED_CONFIG_MARKER="# Managed by new_vps_projects.sh"
 
 die() {
     printf '[!] %s\n' "$*" >&2
@@ -45,7 +50,7 @@ preflight() {
 }
 
 preflight_refresh_compose() {
-    require_command id cp date install mktemp mv rm
+    require_command id cp date install mktemp mv rm grep awk
     [[ $(id -u) == 0 ]] || die "run this script as root to refresh the Compose file"
 }
 
@@ -63,6 +68,41 @@ choose_engine() {
             *) printf '[!] Invalid choice. Enter 1 (Docker) or 2 (Podman).\n' >&2 ;;
         esac
     done
+}
+
+validate_public_access_inputs() {
+    local domain="$1" email="$2"
+
+    [[ ${#domain} -le 253 && $domain =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] ||
+        die "enter a valid lowercase DNS hostname for SlowMeet TLS"
+    [[ $email =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] ||
+        die "enter a valid email address for certificate notices"
+}
+
+choose_public_access() {
+    local choice domain email
+
+    printf '\nConfigure public SlowMeet access with Nginx, TLS, and UFW rules? [y/N]: '
+    IFS= read -r choice || choice=""
+    case "${choice,,}" in
+        ""|n|no)
+            PUBLIC_ACCESS_CHOICE="no"
+            return 0
+            ;;
+        y|yes) ;;
+        *) die "answer yes or no to the public-access setup prompt" ;;
+    esac
+
+    printf 'SlowMeet DNS hostname: '
+    IFS= read -r domain || die "a DNS hostname is required for TLS setup"
+    domain="${domain,,}"
+    printf 'ACME certificate email: '
+    IFS= read -r email || die "an email address is required for TLS setup"
+    validate_public_access_inputs "$domain" "$email"
+
+    PUBLIC_ACCESS_CHOICE="yes"
+    PUBLIC_ACCESS_DOMAIN="$domain"
+    PUBLIC_ACCESS_EMAIL="$email"
 }
 
 install_docker() {
@@ -127,7 +167,9 @@ copy_project_file_if_missing() {
 
 stage_podman_service() {
     local destination="$PROJECTS_DIR/podman-compose.service"
-    local working_directory temporary_file line working_directory_found=0
+    local working_directory temporary_file line profile_args=""
+    local working_directory_found=0 exec_start_found=0 exec_stop_found=0
+    local destination_is_managed=0
 
     [[ -f $PODMAN_SERVICE_TEMPLATE && ! -L $PODMAN_SERVICE_TEMPLATE && -r $PODMAN_SERVICE_TEMPLATE ]] ||
         die "Podman systemd unit template is missing, unreadable, or not a regular file: $PODMAN_SERVICE_TEMPLATE"
@@ -135,8 +177,12 @@ stage_podman_service() {
     if [[ -e $destination || -L $destination ]]; then
         [[ -f $destination && ! -L $destination ]] ||
             die "Podman systemd unit destination is not a regular file: $destination"
-        printf '[+] Preserving existing Podman systemd unit: %s\n' "$destination"
-        return 0
+        if grep -Fqx -- "$MANAGED_CONFIG_MARKER" "$destination"; then
+            destination_is_managed=1
+        else
+            printf '[+] Preserving existing Podman systemd unit: %s\n' "$destination"
+            return 0
+        fi
     fi
 
     working_directory="$(cd -- "$PROJECTS_DIR" && pwd -P)" ||
@@ -144,6 +190,7 @@ stage_podman_service() {
     [[ $working_directory != *$'\n'* ]] || die "projects directory path cannot contain a newline"
     working_directory="${working_directory//\\/\\\\}"
     working_directory="${working_directory//%/%%}"
+    [[ ${PUBLIC_ACCESS_CHOICE:-no} == yes ]] && profile_args=" --profile public"
 
     temporary_file="$(mktemp -- "$PROJECTS_DIR/.podman-compose.service.XXXXXX")" ||
         die "could not stage the Podman systemd unit"
@@ -151,6 +198,12 @@ stage_podman_service() {
         if [[ $line == WorkingDirectory=* ]]; then
             printf 'WorkingDirectory=%s\n' "$working_directory" || return 1
             working_directory_found=1
+        elif [[ $line == ExecStart=* ]]; then
+            printf 'ExecStart=/usr/bin/podman-compose%s up -d\n' "$profile_args" || return 1
+            exec_start_found=1
+        elif [[ $line == ExecStop=* ]]; then
+            printf 'ExecStop=/usr/bin/podman-compose%s down\n' "$profile_args" || return 1
+            exec_stop_found=1
         else
             printf '%s\n' "$line" || return 1
         fi
@@ -158,9 +211,18 @@ stage_podman_service() {
         rm -f -- "$temporary_file"
         die "rendering the Podman systemd unit failed"
     fi
-    if ((working_directory_found == 0)); then
+    if ((working_directory_found == 0 || exec_start_found == 0 || exec_stop_found == 0)); then
         rm -f -- "$temporary_file"
-        die "Podman systemd unit template has no WorkingDirectory setting"
+        die "Podman systemd unit template is missing required settings"
+    fi
+    if ((destination_is_managed)) && cmp -s -- "$temporary_file" "$destination"; then
+        rm -f -- "$temporary_file"
+        printf '[+] Preserving current managed Podman systemd unit: %s\n' "$destination"
+        return 0
+    fi
+    if ((destination_is_managed)); then
+        create_timestamped_backup "$destination"
+        printf '[+] Updated managed Podman systemd unit; previous configuration was saved to %s\n' "$BACKUP_PATH"
     fi
     if ! install -m 0644 -- "$temporary_file" "$destination"; then
         rm -f -- "$temporary_file"
@@ -171,7 +233,8 @@ stage_podman_service() {
 
 refresh_compose() {
     local compose_file="$PROJECTS_DIR/compose.yaml"
-    local timestamp backup_file temporary_file
+    local timestamp backup_file temporary_file proxy_file domain listen_address listen_port published_address
+    local refresh_proxy=no
 
     [[ ! -L $PROJECTS_DIR && -d $PROJECTS_DIR ]] ||
         die "projects directory is missing or is a symlink: $PROJECTS_DIR"
@@ -179,6 +242,20 @@ refresh_compose() {
         die "Compose template is missing, unreadable, or not a regular file: $COMPOSE_TEMPLATE"
     [[ -f $compose_file && ! -L $compose_file ]] ||
         die "Compose destination is missing or is not a regular file: $compose_file"
+
+    listen_address="$(read_compose_slowmeet_value "$compose_file" HTTP_ADDR || true)"
+    published_address="$(read_compose_slowmeet_value "$compose_file" HTTP_PUBLISH_ADDRESS || true)"
+    listen_port="$(read_compose_slowmeet_listen_port "$compose_file" || true)"
+    if [[ $listen_address == 127.* && $listen_port =~ ^[0-9]{1,5}$ &&
+        $published_address =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]]; then
+        domain="$published_address"
+        if [[ -f $NGINX_CONFIG_FILE && ! -L $NGINX_CONFIG_FILE &&
+            -r $LETSENCRYPT_DIR/live/$domain/fullchain.pem &&
+            -r $LETSENCRYPT_DIR/live/$domain/privkey.pem ]]; then
+            assert_managed_generated_file "$NGINX_CONFIG_FILE"
+            refresh_proxy=yes
+        fi
+    fi
 
     timestamp="$(date +%Y%m%d-%H%M%S)" || die "could not create a backup timestamp"
     backup_file="$(mktemp -- "${compose_file}.backup-${timestamp}.XXXXXX")" ||
@@ -189,6 +266,20 @@ refresh_compose() {
     if ! install -m 0644 -- "$COMPOSE_TEMPLATE" "$temporary_file"; then
         rm -f -- "$temporary_file"
         die "staging the refreshed Compose file failed"
+    fi
+    if [[ $refresh_proxy == yes ]]; then
+        PROXY_HTTP_ADDR="127.0.0.1:$listen_port"
+        PROXY_UPSTREAM_PORT="$listen_port"
+        proxy_file="$(mktemp -- "$PROJECTS_DIR/.compose.yaml.proxy.XXXXXX")" ||
+            { rm -f -- "$temporary_file"; die "could not stage the refreshed public-access Compose file"; }
+        if ! render_compose_for_proxy "$temporary_file" "$proxy_file" "$domain"; then
+            rm -f -- "$temporary_file" "$proxy_file"
+            die "could not preserve public-access settings while refreshing Compose"
+        fi
+        chmod 0644 -- "$proxy_file" ||
+            { rm -f -- "$temporary_file" "$proxy_file"; die "could not set refreshed Compose permissions"; }
+        mv -f -- "$proxy_file" "$temporary_file" ||
+            { rm -f -- "$temporary_file" "$proxy_file"; die "could not stage refreshed public-access settings"; }
     fi
     if ! cp -p -- "$compose_file" "$backup_file"; then
         rm -f -- "$backup_file"
@@ -201,6 +292,10 @@ refresh_compose() {
     fi
 
     printf '[+] Compose file refreshed. Previous configuration was saved to %s\n' "$backup_file"
+    if [[ $refresh_proxy == yes ]]; then
+        write_nginx_config tls "$domain" "$listen_port"
+        printf '[+] Managed Nginx configuration refreshed with a timestamped backup.\n'
+    fi
 }
 
 check_placeholder_credentials() {
@@ -249,8 +344,354 @@ read_compose_slowmeet_listen_port() {
     local file="$1" listen_address
 
     listen_address="$(read_compose_slowmeet_value "$file" HTTP_ADDR)" || return 1
-    [[ $listen_address =~ ^:([0-9]{1,5})$ ]] || return 1
-    printf '%s' "${BASH_REMATCH[1]}"
+    [[ $listen_address =~ ^(:|127\.0\.0\.1:)([0-9]{1,5})$ ]] || return 1
+    printf '%s' "${BASH_REMATCH[2]}"
+}
+
+validate_compose_for_public_access() {
+    local domain="$1"
+    local compose_file="$PROJECTS_DIR/compose.yaml"
+    local listen_address published_address configured_port listen_port
+
+    [[ -f $compose_file && ! -L $compose_file ]] ||
+        die "Compose file is missing or is not a regular file: $compose_file"
+    listen_address="$(read_compose_slowmeet_value "$compose_file" HTTP_ADDR || true)"
+    published_address="$(read_compose_slowmeet_value "$compose_file" HTTP_PUBLISH_ADDRESS || true)"
+    configured_port="$(read_compose_slowmeet_value "$compose_file" HTTP_PUBLISH_PORT || true)"
+    listen_port="$(read_compose_slowmeet_listen_port "$compose_file" || true)"
+    [[ $listen_port =~ ^[0-9]{1,5}$ && $listen_port == "$configured_port" ]] ||
+        die "SlowMeet HTTP_PUBLISH_PORT must match its HTTP_ADDR port before proxy setup"
+    [[ $published_address == *replace-with* || $published_address == "$domain" ]] ||
+        die "SlowMeet HTTP_PUBLISH_ADDRESS is customized; set it to $domain before proxy setup"
+
+    if [[ $listen_address =~ ^:([0-9]{1,5})$ ]]; then
+        PROXY_HTTP_ADDR="127.0.0.1:${BASH_REMATCH[1]}"
+    elif [[ $listen_address =~ ^127\.0\.0\.1:([0-9]{1,5})$ ]]; then
+        PROXY_HTTP_ADDR="$listen_address"
+    else
+        die "SlowMeet HTTP_ADDR is customized; use :$listen_port or 127.0.0.1:$listen_port before proxy setup"
+    fi
+    PROXY_UPSTREAM_PORT="$listen_port"
+}
+
+create_timestamped_backup() {
+    local source="$1" timestamp
+
+    BACKUP_PATH=""
+    [[ -e $source || -L $source ]] || return 0
+    [[ -f $source && ! -L $source ]] || die "cannot back up a non-regular file: $source"
+    timestamp="$(date +%Y%m%d-%H%M%S)" || die "could not create a backup timestamp"
+    BACKUP_PATH="$(mktemp -- "${source}.backup-${timestamp}.XXXXXX")" ||
+        die "could not reserve a backup path for $source"
+    if ! cp -p -- "$source" "$BACKUP_PATH"; then
+        rm -f -- "$BACKUP_PATH"
+        BACKUP_PATH=""
+        die "backing up $source failed"
+    fi
+}
+
+assert_managed_generated_file() {
+    local file="$1"
+
+    [[ -e $file || -L $file ]] || return 0
+    [[ -f $file && ! -L $file ]] ||
+        die "managed configuration path is not a regular file: $file"
+    grep -Fqx -- "$MANAGED_CONFIG_MARKER" "$file" ||
+        die "refusing to overwrite unmanaged configuration: $file"
+}
+
+preflight_nginx_configuration() {
+    assert_managed_generated_file "$NGINX_CONFIG_FILE"
+    assert_managed_generated_file "$CERTBOT_DEPLOY_HOOK_DIR/vps-projects-nginx-reload"
+}
+
+render_nginx_config() {
+    local destination="$1" mode="$2" domain="$3" upstream_port="$4"
+
+    if [[ $mode == bootstrap ]]; then
+        cat > "$destination" <<EOF
+$MANAGED_CONFIG_MARKER
+map \$http_upgrade \$vps_projects_connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen 80;
+    server_name $domain;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+    }
+
+    location / {
+        return 404;
+    }
+}
+EOF
+    return
+    fi
+
+    cat > "$destination" <<EOF
+$MANAGED_CONFIG_MARKER
+map \$http_upgrade \$vps_projects_connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+server {
+    listen 80;
+    server_name $domain;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name $domain;
+
+    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://127.0.0.1:$upstream_port;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$vps_projects_connection_upgrade;
+        proxy_read_timeout 2h;
+        proxy_send_timeout 2h;
+    }
+}
+EOF
+}
+
+write_nginx_config() {
+    local mode="$1" domain="$2" upstream_port="$3" temporary_file
+
+    assert_managed_generated_file "$NGINX_CONFIG_FILE"
+    temporary_file="$(mktemp -- "$PROJECTS_DIR/.nginx.conf.XXXXXX")" ||
+        die "could not stage the Compose Nginx configuration"
+    if ! render_nginx_config "$temporary_file" "$mode" "$domain" "$upstream_port"; then
+        rm -f -- "$temporary_file"
+        die "rendering the Compose Nginx configuration failed"
+    fi
+    create_timestamped_backup "$NGINX_CONFIG_FILE"
+    NGINX_CONFIG_LAST_BACKUP="$BACKUP_PATH"
+    if ! chmod 0644 -- "$temporary_file" || ! mv -f -- "$temporary_file" "$NGINX_CONFIG_FILE"; then
+        rm -f -- "$temporary_file"
+        die "installing the Compose Nginx configuration failed"
+    fi
+}
+
+restore_nginx_config() {
+    local backup="$1"
+
+    if [[ -n $backup ]]; then
+        cp -p -- "$backup" "$NGINX_CONFIG_FILE" ||
+            die "could not restore the previous Compose Nginx configuration; backup: $backup"
+    else
+        rm -f -- "$NGINX_CONFIG_FILE" || die "could not remove the failed Compose Nginx configuration"
+    fi
+}
+
+compose_command() {
+    case "${ENGINE_CHOICE:-}" in
+        docker) docker compose "$@" ;;
+        podman) podman-compose "$@" ;;
+        *) die "choose Docker or Podman before running Compose commands" ;;
+    esac
+}
+
+compose_in_project() {
+    (cd -- "$PROJECTS_DIR" && compose_command "$@")
+}
+
+write_certbot_deploy_hook() {
+    local hook_file="$CERTBOT_DEPLOY_HOOK_DIR/vps-projects-nginx-reload"
+    local temporary_file quoted_project_dir reload_command
+
+    assert_managed_generated_file "$hook_file"
+    run_required "creating Certbot deploy-hook directory" install -d -m 0755 -- "$CERTBOT_DEPLOY_HOOK_DIR"
+    temporary_file="$(mktemp -- "$CERTBOT_DEPLOY_HOOK_DIR/.vps-projects-nginx-reload.XXXXXX")" ||
+        die "could not stage the Certbot Nginx reload hook"
+    printf -v quoted_project_dir '%q' "$PROJECTS_DIR"
+    case "${ENGINE_CHOICE:-}" in
+        docker) reload_command="docker compose --profile public exec -T nginx nginx -s reload" ;;
+        podman) reload_command="podman-compose --profile public exec -T nginx nginx -s reload" ;;
+        *) rm -f -- "$temporary_file"; die "choose Docker or Podman before installing the Certbot hook" ;;
+    esac
+    cat > "$temporary_file" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+$MANAGED_CONFIG_MARKER
+cd -- $quoted_project_dir
+exec $reload_command
+EOF
+    create_timestamped_backup "$hook_file"
+    if ! chmod 0750 -- "$temporary_file" || ! mv -f -- "$temporary_file" "$hook_file"; then
+        rm -f -- "$temporary_file"
+        die "installing the Certbot Nginx reload hook failed"
+    fi
+}
+
+render_compose_for_proxy() {
+    local source_file="$1" destination="$2" domain="$3"
+    local listen_address="$PROXY_HTTP_ADDR"
+    local published_address="$domain"
+    if ! awk -v address="$listen_address" -v published="$published_address" '
+        $0 == "  slowmeet:" { in_slowmeet = 1; print; next }
+        in_slowmeet && /^[^[:space:]]/ { in_slowmeet = 0 }
+        in_slowmeet && /^[[:space:]]+HTTP_ADDR:[[:space:]]*/ {
+            sub(/HTTP_ADDR:.*/, "HTTP_ADDR: \"" address "\"")
+            address_count++
+        }
+        in_slowmeet && /^[[:space:]]+HTTP_PUBLISH_ADDRESS:[[:space:]]*/ {
+            sub(/HTTP_PUBLISH_ADDRESS:.*/, "HTTP_PUBLISH_ADDRESS: \"" published "\"")
+            published_count++
+        }
+        { print }
+        END {
+            if (address_count != 1 || published_count != 1) {
+                exit 1
+            }
+        }
+    ' "$source_file" > "$destination"; then
+        return 1
+    fi
+}
+
+update_compose_for_proxy() {
+    local domain="$1"
+    local compose_file="$PROJECTS_DIR/compose.yaml"
+    local temporary_file
+
+    validate_compose_for_public_access "$domain"
+    temporary_file="$(mktemp -- "$PROJECTS_DIR/.compose.yaml.proxy.XXXXXX")" ||
+        die "could not stage the public-access Compose update"
+    if ! render_compose_for_proxy "$compose_file" "$temporary_file" "$domain"; then
+        rm -f -- "$temporary_file"
+        die "Compose must contain exactly one SlowMeet HTTP_ADDR and HTTP_PUBLISH_ADDRESS setting"
+    fi
+    chmod 0644 -- "$temporary_file" ||
+        { rm -f -- "$temporary_file"; die "setting public-access Compose permissions failed"; }
+
+    create_timestamped_backup "$compose_file"
+    COMPOSE_PUBLIC_ACCESS_BACKUP="$BACKUP_PATH"
+    if ! mv -f -- "$temporary_file" "$compose_file"; then
+        rm -f -- "$temporary_file"
+        die "installing the public-access Compose update failed"
+    fi
+}
+
+restore_compose_after_proxy_failure() {
+    local backup="$1"
+
+    [[ -n $backup ]] || return 0
+    cp -p -- "$backup" "$PROJECTS_DIR/compose.yaml" ||
+        die "could not restore Compose after Nginx setup failed; backup: $backup"
+    printf '[!] Restored the previous Compose file from %s.\n' "$backup" >&2
+}
+
+configure_slowmeet_public_access() {
+    local domain="$1" email="$2" certificate_dir nginx_backup
+
+    validate_public_access_inputs "$domain" "$email"
+    validate_compose_for_public_access "$domain"
+    require_command apt-get date install mktemp mv rm cp chmod grep awk systemctl
+    preflight_nginx_configuration
+
+    run_required "updating apt package lists for TLS" apt-get update
+    run_required "installing host Certbot and UFW" apt-get install -y certbot ufw
+    require_command certbot ufw
+    run_required "creating ACME webroot" install -d -m 0755 -- "$ACME_WEBROOT"
+
+    run_required "adding the HTTP firewall rule" ufw allow 80/tcp comment 'SlowMeet Nginx HTTP'
+    run_required "adding the HTTPS firewall rule" ufw allow 443/tcp comment 'SlowMeet Nginx HTTPS'
+    run_required "adding the WebRTC UDP firewall rule" ufw allow 50000:50100/udp comment 'SlowMeet WebRTC media'
+
+    write_nginx_config bootstrap "$domain" "$PROXY_UPSTREAM_PORT"
+    write_certbot_deploy_hook
+    run_required "starting only the Compose Nginx proxy for ACME" \
+        compose_in_project --profile public up -d nginx
+
+    if ! certbot certonly \
+        --webroot --webroot-path "$ACME_WEBROOT" --non-interactive --agree-tos \
+        --email "$email" --cert-name "$domain" -d "$domain" \
+        --deploy-hook "$CERTBOT_DEPLOY_HOOK_DIR/vps-projects-nginx-reload"; then
+        printf '[!] Certificate issuance failed; the HTTP ACME site remains active. Check DNS and public TCP port 80, then rerun setup.\n' >&2
+        die "requesting the SlowMeet TLS certificate failed"
+    fi
+    certificate_dir="$LETSENCRYPT_DIR/live/$domain"
+    [[ -r $certificate_dir/fullchain.pem && -r $certificate_dir/privkey.pem ]] ||
+        die "Certbot completed without readable certificate files in $certificate_dir"
+
+    update_compose_for_proxy "$domain"
+    write_nginx_config tls "$domain" "$PROXY_UPSTREAM_PORT"
+    nginx_backup="$NGINX_CONFIG_LAST_BACKUP"
+    if ! compose_in_project --profile public exec -T nginx nginx -t; then
+        restore_nginx_config "$nginx_backup"
+        restore_compose_after_proxy_failure "$COMPOSE_PUBLIC_ACCESS_BACKUP"
+        die "TLS Compose Nginx configuration failed validation; restored the HTTP configuration"
+    fi
+    if ! compose_in_project --profile public exec -T nginx nginx -s reload; then
+        restore_nginx_config "$nginx_backup"
+        restore_compose_after_proxy_failure "$COMPOSE_PUBLIC_ACCESS_BACKUP"
+        compose_in_project --profile public exec -T nginx nginx -s reload || true
+        die "Compose Nginx could not reload the TLS configuration; restored the previous HTTP configuration"
+    fi
+    run_required "enabling automatic Certbot renewals" systemctl enable --now certbot.timer
+
+    PUBLIC_ACCESS_CONFIGURED="yes"
+    printf '[+] SlowMeet HTTPS is configured for https://%s/.\n' "$domain"
+    printf '[+] The Compose Nginx proxy is running; SlowMeet and Crab Dump remain stopped.\n'
+    printf '[+] UFW allow rules were added; its existing enabled state and default policies were preserved.\n'
+}
+
+print_start_instructions() {
+    printf '\n[+] After editing the environment files, start the stack from %s:\n' "$PROJECTS_DIR"
+    case "${ENGINE_CHOICE:-}" in
+        docker)
+            if [[ ${PUBLIC_ACCESS_CONFIGURED:-no} == yes ]]; then
+                printf '    docker compose --profile public up -d\n'
+            else
+                printf '    docker compose up -d\n'
+            fi
+            ;;
+        podman)
+            if [[ ${PUBLIC_ACCESS_CONFIGURED:-no} == yes ]]; then
+                printf '    podman-compose --profile public up -d\n'
+            else
+                printf '    podman-compose up -d\n'
+            fi
+            printf '[+] Optional Podman startup on reboot, after editing the environment files:\n'
+            printf '    sudo install -m 0644 podman-compose.service /etc/systemd/system/vps-projects-podman.service\n'
+            printf '    sudo systemctl daemon-reload\n'
+            printf '    sudo systemctl enable --now vps-projects-podman.service\n'
+            ;;
+        *) die "choose Docker or Podman before printing start instructions" ;;
+    esac
+    if [[ ${PUBLIC_ACCESS_CONFIGURED:-no} == yes ]]; then
+        printf '[+] Nginx serves SlowMeet on TCP 80/443; its HTTP backend is bound to loopback port %s.\n' \
+            "$PROXY_UPSTREAM_PORT"
+        printf '[!] Confirm the cloud firewall allows TCP 80/443 and UDP 50000-50100.\n'
+    else
+        printf '[!] SlowMeet uses host networking and listens directly on host TCP 1102 and UDP 50000-50100 when exposed.\n'
+        printf '[!] Host and cloud firewall rules were left unchanged; allow those ports only when you are ready to expose SlowMeet.\n'
+        printf '[!] The optional Compose Nginx public profile is not configured or started.\n'
+    fi
+    printf '[+] To refresh Compose and managed Nginx configuration later, run: sudo bash %q --refresh-compose\n' \
+        "$SCRIPT_DIR/new_vps_projects.sh"
 }
 
 validate_project_configuration() {
@@ -298,25 +739,8 @@ prepare_project_stack() {
     copy_project_file_if_missing "$SLOW_MEET_ENV_TEMPLATE" "$PROJECTS_DIR/slow_meet.env" 0600 "SlowMeet environment"
     stage_podman_service
 
-    printf '\n[+] Project configuration is staged in %s; containers were not started.\n' "$PROJECTS_DIR"
+    printf '\n[+] Project configuration is staged in %s; app containers were not started.\n' "$PROJECTS_DIR"
     validate_project_configuration
-    printf '[!] SlowMeet uses host networking and listens directly on host TCP 1102 and UDP 50000-50100 when exposed.\n'
-    printf '[!] Host and cloud firewall rules were left unchanged; allow those ports only when you are ready to expose SlowMeet.\n'
-    printf '[!] This container-only setup does not configure a reverse proxy or TLS.\n'
-    printf '[+] After editing compose.yaml and the environment files, run from %s:\n' "$PROJECTS_DIR"
-    case "${ENGINE_CHOICE:-}" in
-        docker) printf '    docker compose up -d\n' ;;
-        podman)
-            printf '    podman-compose up -d\n'
-            printf '[+] Optional Podman startup on reboot, after editing compose.yaml and the environment files:\n'
-            printf '    sudo install -m 0644 podman-compose.service /etc/systemd/system/vps-projects-podman.service\n'
-            printf '    sudo systemctl daemon-reload\n'
-            printf '    sudo systemctl enable --now vps-projects-podman.service\n'
-            ;;
-        *) die "choose Docker or Podman before preparing projects" ;;
-    esac
-    printf '[+] To refresh Compose from this installer template later, run: sudo bash %q --refresh-compose\n' \
-        "$SCRIPT_DIR/new_vps_projects.sh"
 }
 
 install_selected_engine() {
@@ -326,6 +750,10 @@ install_selected_engine() {
         *) die "choose Docker or Podman before installing an engine" ;;
     esac
     prepare_project_stack
+    if [[ ${PUBLIC_ACCESS_CHOICE:-no} == yes ]]; then
+        configure_slowmeet_public_access "$PUBLIC_ACCESS_DOMAIN" "$PUBLIC_ACCESS_EMAIL"
+    fi
+    print_start_instructions
 }
 
 main() {
@@ -337,6 +765,7 @@ main() {
 
     preflight "$@"
     choose_engine
+    choose_public_access
     install_selected_engine
 }
 
