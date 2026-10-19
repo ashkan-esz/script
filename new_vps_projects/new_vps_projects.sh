@@ -223,34 +223,41 @@ check_placeholder_credentials() {
     done < "$file"
 }
 
-read_env_value() {
-    local file="$1" wanted_key="$2" line value=""
+read_compose_slowmeet_value() {
+    local file="$1" wanted_key="$2" line value in_slowmeet=0
 
     while IFS= read -r line || [[ -n $line ]]; do
-        [[ $line == "$wanted_key="* ]] || continue
-        value="${line#*=}"
-    done < "$file"
-    printf '%s' "$value"
-}
-
-read_compose_slowmeet_host_port() {
-    local file="$1" line mapping
-
-    while IFS= read -r line || [[ -n $line ]]; do
-        [[ $line == *'"0.0.0.0:'*':8080/tcp"'* ]] || continue
-        mapping="${line#*0.0.0.0:}"
-        mapping="${mapping%%:8080/tcp*}"
-        printf '%s' "$mapping"
+        if [[ $line == '  slowmeet:' ]]; then
+            in_slowmeet=1
+            continue
+        fi
+        if ((in_slowmeet)) && [[ $line =~ ^[^[:space:]] ]]; then
+            break
+        fi
+        ((in_slowmeet)) || continue
+        [[ $line =~ ^[[:space:]]+$wanted_key:[[:space:]]* ]] || continue
+        value="${line#*"$wanted_key:"}"
+        value="${value//\"/}"
+        value="${value//[[:space:]]/}"
+        printf '%s' "$value"
         return 0
     done < "$file"
     return 1
+}
+
+read_compose_slowmeet_listen_port() {
+    local file="$1" listen_address
+
+    listen_address="$(read_compose_slowmeet_value "$file" HTTP_ADDR)" || return 1
+    [[ $listen_address =~ ^:([0-9]{1,5})$ ]] || return 1
+    printf '%s' "${BASH_REMATCH[1]}"
 }
 
 validate_project_configuration() {
     local crab_dump_env="$PROJECTS_DIR/crab_dump.env"
     local slow_meet_env="$PROJECTS_DIR/slow_meet.env"
     local compose_file="$PROJECTS_DIR/compose.yaml"
-    local configured_port published_port
+    local configured_port listen_port published_address
     local PLACEHOLDER_FOUND=0
 
     check_placeholder_credentials "$crab_dump_env"
@@ -261,13 +268,22 @@ validate_project_configuration() {
         printf '[+] No placeholder credentials were found in the staged environment files.\n'
     fi
 
-    configured_port="$(read_env_value "$slow_meet_env" HTTP_PUBLISH_PORT)"
-    published_port="$(read_compose_slowmeet_host_port "$compose_file" || true)"
-    if [[ $configured_port =~ ^[0-9]{1,5}$ && $configured_port == "$published_port" ]]; then
-        printf '[+] SlowMeet HTTP_PUBLISH_PORT matches the published host port (%s).\n' "$configured_port"
+    configured_port="$(read_compose_slowmeet_value "$compose_file" HTTP_PUBLISH_PORT || true)"
+    listen_port="$(read_compose_slowmeet_listen_port "$compose_file" || true)"
+    if [[ $configured_port =~ ^[0-9]{1,5}$ && $configured_port == "$listen_port" ]]; then
+        printf '[+] SlowMeet HTTP_PUBLISH_PORT matches the HTTP_ADDR host-listener port (%s).\n' "$configured_port"
     else
-        printf '[!] SlowMeet HTTP_PUBLISH_PORT (%s) does not match the Compose host port (%s); align them before starting the stack.\n' \
-            "${configured_port:-missing}" "${published_port:-missing}"
+        printf '[!] SlowMeet HTTP_PUBLISH_PORT (%s) does not match the HTTP_ADDR host-listener port (%s); align them before starting the stack.\n' \
+            "${configured_port:-missing}" "${listen_port:-missing}"
+    fi
+
+    published_address="$(read_compose_slowmeet_value "$compose_file" HTTP_PUBLISH_ADDRESS || true)"
+    if [[ -z $published_address || $published_address == 0.0.0.0 || $published_address == :: ||
+        $published_address == ::1 || $published_address == localhost || $published_address == 127.* ||
+        $published_address == *replace-with* || $published_address == *://* || $published_address =~ [[:space:]] ]]; then
+        printf '[!] SlowMeet HTTP_PUBLISH_ADDRESS must be a reachable server IP or DNS name, not a placeholder or wildcard.\n'
+    else
+        printf '[+] SlowMeet HTTP_PUBLISH_ADDRESS is configured.\n'
     fi
 }
 
@@ -284,15 +300,15 @@ prepare_project_stack() {
 
     printf '\n[+] Project configuration is staged in %s; containers were not started.\n' "$PROJECTS_DIR"
     validate_project_configuration
-    printf '[!] SlowMeet needs inbound TCP 1102 and UDP 50000-50100 when exposed; firewall rules were left unchanged.\n'
-    printf '[!] Docker-published ports can bypass UFW filtering; check the host and provider firewall settings.\n'
+    printf '[!] SlowMeet uses host networking and listens directly on host TCP 1102 and UDP 50000-50100 when exposed.\n'
+    printf '[!] Host and cloud firewall rules were left unchanged; allow those ports only when you are ready to expose SlowMeet.\n'
     printf '[!] This container-only setup does not configure a reverse proxy or TLS.\n'
-    printf '[+] After editing the environment files, run from %s:\n' "$PROJECTS_DIR"
+    printf '[+] After editing compose.yaml and the environment files, run from %s:\n' "$PROJECTS_DIR"
     case "${ENGINE_CHOICE:-}" in
         docker) printf '    docker compose up -d\n' ;;
         podman)
             printf '    podman-compose up -d\n'
-            printf '[+] Optional Podman startup on reboot, after editing the environment files:\n'
+            printf '[+] Optional Podman startup on reboot, after editing compose.yaml and the environment files:\n'
             printf '    sudo install -m 0644 podman-compose.service /etc/systemd/system/vps-projects-podman.service\n'
             printf '    sudo systemctl daemon-reload\n'
             printf '    sudo systemctl enable --now vps-projects-podman.service\n'
