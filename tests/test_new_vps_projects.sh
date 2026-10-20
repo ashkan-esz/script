@@ -134,12 +134,6 @@ fi
     fail "all services should keep host networking"
 assert_contains "$(< "$COMPOSE_FILE")" 'profiles:' "Nginx should be profile-gated"
 assert_contains "$(< "$COMPOSE_FILE")" '      - public' "the public profile should be opt-in"
-assert_contains "$(< "$COMPOSE_FILE")" './nginx.conf:/etc/nginx/conf.d/default.conf:ro' \
-    "the Compose Nginx service should mount its staged config"
-assert_contains "$(< "$COMPOSE_FILE")" '/etc/letsencrypt:/etc/letsencrypt:ro' \
-    "the Compose Nginx service should read host-managed certificates"
-assert_contains "$(< "$COMPOSE_FILE")" './acme-webroot:/var/www/letsencrypt:ro' \
-    "the Compose Nginx service should serve the shared ACME webroot"
 assert_contains "$(< "$COMPOSE_FILE")" 'HTTP_ADDR: ":1102"' \
     "SlowMeet should bind directly to host port 1102"
 assert_contains "$(< "$COMPOSE_FILE")" \
@@ -147,6 +141,12 @@ assert_contains "$(< "$COMPOSE_FILE")" \
     "SlowMeet's advertised address should stay in Compose"
 assert_contains "$(< "$COMPOSE_FILE")" 'HTTP_PUBLISH_PORT: "1102"' \
     "SlowMeet's advertised port should stay in Compose"
+assert_contains "$(< "$COMPOSE_FILE")" '${NGINX_CONFIG_FILE:-./nginx.conf}' \
+    "Compose should mount the Nginx config path selected by the installer"
+assert_contains "$(< "$COMPOSE_FILE")" '${ACME_WEBROOT:-./acme-webroot}' \
+    "Compose should mount the ACME webroot selected by the installer"
+assert_contains "$(< "$COMPOSE_FILE")" '${LETSENCRYPT_DIR:-/etc/letsencrypt}' \
+    "Compose should mount the certificate directory used by Certbot"
 if grep -q '^[[:space:]]*ports:' "$COMPOSE_FILE"; then
     fail "host-network services should not configure Compose port mappings"
 fi
@@ -173,6 +173,15 @@ if grep -Eq '^(DB_NAME_0|TG_CHAT_ID_0|DASHBOARD_USERNAME|ENCRYPTION_TYPE)=' "$CR
 fi
 assert_contains "$(< "$PODMAN_SERVICE_FILE")" "WorkingDirectory=$PROJECTS_DIR" \
     "Podman systemd unit should use the resolved projects directory"
+assert_contains "$(< "$PODMAN_SERVICE_FILE")" "Environment=\"NGINX_CONFIG_FILE=$NGINX_CONFIG_FILE\"" \
+    "Podman systemd unit should persist the selected Nginx config path"
+assert_contains "$(< "$PODMAN_SERVICE_FILE")" "Environment=\"ACME_WEBROOT=$ACME_WEBROOT\"" \
+    "Podman systemd unit should persist the selected ACME webroot"
+assert_contains "$(< "$PODMAN_SERVICE_FILE")" "Environment=\"LETSENCRYPT_DIR=$LETSENCRYPT_DIR\"" \
+    "Podman systemd unit should persist the selected certificate directory"
+assert_eq "$(systemd_environment_line CUSTOM_PATH 'path with 100% and "quotes"')" \
+    'Environment="CUSTOM_PATH=path with 100%% and \"quotes\""' \
+    "systemd environment values should escape quotes and specifiers"
 if grep -q -- '--profile public' "$PODMAN_SERVICE_FILE"; then
     fail "public profile should not be enabled for a direct-access stack"
 fi
@@ -192,7 +201,7 @@ START_LINE="$(grep -n 'After editing the environment files' "$STAGE_OUTPUT" | cu
 
 printf 'DATABASE_URL_0=postgresql://user:custom@127.0.0.1:5432/app\n' > "$CRAB_DUMP_ENV_FILE"
 printf 'ADMIN_PASSWORD=custom-password\nTURN_PASSWORD=custom-turn-password\n' > "$SLOW_MEET_ENV_FILE"
-set_compose_slowmeet_value HTTP_PUBLISH_ADDRESS meet.example.com
+set_compose_slowmeet_value HTTP_PUBLISH_ADDRESS meet.g69.lol
 set_compose_slowmeet_value HTTP_PUBLISH_PORT 1103
 prepare_project_stack > "$STAGE_OUTPUT"
 assert_contains "$(< "$STAGE_OUTPUT")" \
@@ -231,6 +240,12 @@ PUBLIC_ACCESS_CHOICE=no
 assert_contains "$(< "$MENU_OUTPUT")" "Invalid choice" "invalid input should be explained"
 assert_contains "$(< "$STAGE_OUTPUT")" "systemctl enable --now vps-projects-podman.service" \
     "the optional Podman systemd unit should only be offered as a manual action"
+assert_contains "$(< "$STAGE_OUTPUT")" \
+    "NGINX_CONFIG_FILE=$NGINX_CONFIG_FILE ACME_WEBROOT=$ACME_WEBROOT LETSENCRYPT_DIR=$LETSENCRYPT_DIR podman-compose up -d" \
+    "manual Podman Compose commands should retain the selected public-service paths"
+assert_contains "$(< "$STAGE_OUTPUT")" \
+    "sudo env NGINX_CONFIG_FILE=$NGINX_CONFIG_FILE ACME_WEBROOT=$ACME_WEBROOT LETSENCRYPT_DIR=$LETSENCRYPT_DIR bash" \
+    "the Compose refresh command should retain the selected public-service paths"
 assert_eq "$(< "$CRAB_DUMP_ENV_FILE")" "local-crab-config" "existing Crab Dump env should be preserved"
 assert_eq "$(< "$SLOW_MEET_ENV_FILE")" $'TURN_PASSWORD=custom-turn-password\nlocal-slowmeet-config' \
     "existing SlowMeet env should be preserved"
@@ -268,23 +283,35 @@ PUBLIC_ACCESS_CHOICE="no"
 choose_public_access <<< "no" > "$STAGE_OUTPUT"
 assert_eq "$PUBLIC_ACCESS_CHOICE" "no" "public-access setup should default to skipped"
 [[ ! -s $PUBLIC_SETUP_LOG ]] || fail "skipping public access must not install packages or change host state"
-choose_public_access <<< $'yes\nMEET.EXAMPLE.COM\nops@example.com' > "$STAGE_OUTPUT"
+choose_public_access <<< $'yes\nops@example.com' > "$STAGE_OUTPUT"
 assert_eq "$PUBLIC_ACCESS_CHOICE" "yes" "the opt-in response should select public setup"
-assert_eq "$PUBLIC_ACCESS_DOMAIN" "meet.example.com" "the DNS hostname should be normalized"
+assert_eq "$PUBLIC_ACCESS_DOMAIN" "meet.g69.lol" "the fixed DNS hostname should be selected"
 assert_eq "$PUBLIC_ACCESS_EMAIL" "ops@example.com" "the ACME email should be retained"
+if grep -q 'SlowMeet DNS hostname' "$STAGE_OUTPUT"; then
+    fail "public setup should not prompt for the fixed DNS hostname"
+fi
 PUBLIC_ACCESS_CHOICE="no"
 
-if (configure_slowmeet_public_access bad-domain ops@example.com) > "$STAGE_OUTPUT" 2>&1; then
-    fail "invalid TLS domains should be rejected"
+if (configure_slowmeet_public_access invalid-email) > "$STAGE_OUTPUT" 2>&1; then
+    fail "invalid TLS email should be rejected"
 fi
 [[ ! -s $PUBLIC_SETUP_LOG ]] || fail "invalid TLS input must be rejected before host changes"
+
+assert_contains "$(< "$ROOT_DIR/new_vps_projects/nginx/http.conf")" \
+    "server_name meet.g69.lol" "the HTTP bootstrap config should use the fixed hostname"
+assert_contains "$(< "$ROOT_DIR/new_vps_projects/nginx/http.conf")" \
+    "/.well-known/acme-challenge/" "the HTTP bootstrap config should serve ACME challenges"
+assert_contains "$(< "$ROOT_DIR/new_vps_projects/nginx/tls.conf")" \
+    "server_name meet.g69.lol" "the TLS config should use the fixed hostname"
+assert_contains "$(< "$ROOT_DIR/new_vps_projects/nginx/tls.conf")" \
+    "proxy_pass http://127.0.0.1:1102" "the TLS config should proxy to the host-networked SlowMeet listener"
 
 cp -- "$ROOT_DIR/new_vps_projects/compose.yaml" "$COMPOSE_FILE"
 ENGINE_CHOICE=docker
 : > "$PUBLIC_SETUP_LOG"
 CERTBOT_FAIL=1
 export CERTBOT_FAIL
-if (configure_slowmeet_public_access meet.example.com ops@example.com) > "$STAGE_OUTPUT" 2>&1; then
+if (configure_slowmeet_public_access ops@example.com) > "$STAGE_OUTPUT" 2>&1; then
     fail "certificate issuance failure should stop public-access setup"
 fi
 unset CERTBOT_FAIL
@@ -307,10 +334,10 @@ if grep -Eq 'compose .*up .* (slowmeet|crab-dump)' "$START_LOG"; then
 fi
 
 : > "$PUBLIC_SETUP_LOG"
-configure_slowmeet_public_access meet.example.com ops@example.com > "$STAGE_OUTPUT"
+configure_slowmeet_public_access ops@example.com > "$STAGE_OUTPUT"
 assert_contains "$(< "$COMPOSE_FILE")" 'HTTP_ADDR: "127.0.0.1:1102"' \
     "proxy mode should bind the host-network HTTP backend to loopback"
-assert_contains "$(< "$COMPOSE_FILE")" 'HTTP_PUBLISH_ADDRESS: "meet.example.com"' \
+assert_contains "$(< "$COMPOSE_FILE")" 'HTTP_PUBLISH_ADDRESS: "meet.g69.lol"' \
     "proxy mode should configure the public SlowMeet hostname in Compose"
 assert_contains "$(< "$COMPOSE_FILE")" 'network_mode: host' \
     "proxy setup should retain host networking"
@@ -326,6 +353,15 @@ assert_contains "$(< "$PUBLIC_SETUP_LOG")" "certbot certonly --webroot" \
     "TLS issuance should use the ACME webroot flow"
 assert_contains "$(< "$PUBLIC_SETUP_LOG")" "--deploy-hook $CERTBOT_DEPLOY_HOOK_DIR/vps-projects-nginx-reload" \
     "initial issuance should install the Compose Nginx renewal hook"
+assert_contains "$(< "$CERTBOT_DEPLOY_HOOK_DIR/vps-projects-nginx-reload")" \
+    "export NGINX_CONFIG_FILE=$NGINX_CONFIG_FILE" \
+    "the Certbot renewal hook should retain the selected Nginx config path"
+assert_contains "$(< "$CERTBOT_DEPLOY_HOOK_DIR/vps-projects-nginx-reload")" \
+    "export ACME_WEBROOT=$ACME_WEBROOT" \
+    "the Certbot renewal hook should retain the selected ACME webroot"
+assert_contains "$(< "$CERTBOT_DEPLOY_HOOK_DIR/vps-projects-nginx-reload")" \
+    "export LETSENCRYPT_DIR=$LETSENCRYPT_DIR" \
+    "the Certbot renewal hook should retain the selected certificate directory"
 assert_contains "$(< "$CERTBOT_DEPLOY_HOOK_DIR/vps-projects-nginx-reload")" \
     "docker compose --profile public exec -T nginx nginx -s reload" \
     "automatic certificate renewals should reload the Compose Nginx service"
@@ -363,20 +399,20 @@ id() {
 }
 main --refresh-compose > "$STAGE_OUTPUT"
 unset -f id
-assert_contains "$(< "$NGINX_CONFIG_FILE")" "server_name meet.example.com" \
-    "refresh should regenerate the managed proxy config using the configured domain"
+assert_contains "$(< "$NGINX_CONFIG_FILE")" "server_name meet.g69.lol" \
+    "refresh should restore the fixed-hostname managed proxy config"
 assert_contains "$(< "$COMPOSE_FILE")" 'HTTP_ADDR: "127.0.0.1:1102"' \
     "refresh should preserve the proxy loopback listener"
-assert_contains "$(< "$COMPOSE_FILE")" 'HTTP_PUBLISH_ADDRESS: "meet.example.com"' \
+assert_contains "$(< "$COMPOSE_FILE")" 'HTTP_PUBLISH_ADDRESS: "meet.g69.lol"' \
     "refresh should preserve the configured public address"
 NGINX_BACKUPS=("$NGINX_CONFIG_FILE".backup-*)
 ((${#NGINX_BACKUPS[@]} >= 1)) || fail "proxy config refresh should make a timestamped backup"
-printf '%s\n' "$OLD_NGINX_CONFIG" | grep -q "server_name meet.example.com" ||
-    fail "the previous Nginx config should contain the configured public domain"
+printf '%s\n' "$OLD_NGINX_CONFIG" | grep -q "server_name meet.g69.lol" ||
+    fail "the previous Nginx config should contain the fixed public domain"
 
 printf 'operator-managed nginx config\n' > "$NGINX_CONFIG_FILE"
 : > "$PUBLIC_SETUP_LOG"
-if (configure_slowmeet_public_access meet.example.com ops@example.com) > "$STAGE_OUTPUT" 2>&1; then
+if (configure_slowmeet_public_access ops@example.com) > "$STAGE_OUTPUT" 2>&1; then
     fail "public setup should refuse to overwrite unmanaged Compose Nginx configuration"
 fi
 assert_eq "$(< "$NGINX_CONFIG_FILE")" "operator-managed nginx config" \
